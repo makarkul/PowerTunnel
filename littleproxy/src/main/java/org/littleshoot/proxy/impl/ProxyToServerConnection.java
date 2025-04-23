@@ -584,7 +584,15 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
         }
 
         if (is(DISCONNECTED) && msg instanceof HttpRequest) {
-            LOG.debug("Currently disconnected, connect and then write the message");
+            LOG.info("=== Starting new connection ===\n" +
+                    "  Remote Address: {}\n" +
+                    "  Connect Timeout: {} ms\n" +
+                    "  Transport Protocol: {}\n" +
+                    "  Initial Request URI: {}",
+                    remoteAddress,
+                    proxyServer.getConnectTimeout(),
+                    transportProtocol,
+                    ((HttpRequest) msg).uri());
             connectAndWrite((HttpRequest) msg);
         } else {
             if (isConnecting()) {
@@ -604,7 +612,19 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
             // only write this message if a connection was established and is not in the process of disconnecting or
             // already disconnected
             if (isConnecting() || getCurrentState().isDisconnectingOrDisconnected()) {
-                LOG.debug("Connection failed or timed out while waiting to write message to server. Message will be discarded: {}", msg);
+                LOG.error("=== Connection failed or timed out ===\n" +
+                        "  Remote Address: {}\n" +
+                        "  Connect Timeout: {} ms\n" +
+                        "  Transport Protocol: {}\n" +
+                        "  Initial Request URI: {}\n" +
+                        "  Message Type: {}\n" +
+                        "  Current State: {}",
+                        remoteAddress,
+                        proxyServer.getConnectTimeout(),
+                        transportProtocol,
+                        initialRequest != null ? initialRequest.uri() : "N/A",
+                        msg.getClass().getSimpleName(),
+                        getCurrentState());
                 return;
             }
 
@@ -670,6 +690,17 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
 
     @Override
     protected void timedOut() {
+        LOG.error("=== Connection timed out ===\n" +
+                 "  Remote Address: {}\n" +
+                 "  Connect Timeout: {} ms\n" +
+                 "  Idle Timeout: {} ms\n" +
+                 "  Transport Protocol: {}\n" +
+                 "  Initial Request URI: {}",
+                 remoteAddress,
+                 proxyServer.getConnectTimeout(),
+                 proxyServer.getIdleConnectionTimeout(),
+                 transportProtocol,
+                 initialRequest != null ? initialRequest.uri() : "N/A");
         super.timedOut();
         clientConnection.timedOut(this);
     }

@@ -1,0 +1,49 @@
+[
+  {
+    "key": "test-check",
+    "defaultValue": true,
+    "type": "checkbox"
+  },
+  {
+    "key": "test-select",
+    "title": "Test Preference (select)",
+    "description": "Select Test Preference Description",
+    "defaultValue": "opt1",
+    "type": "select",
+    "items": [
+      {
+        "key": "opt1",
+        "name": "Option 1 Name"
+      }
+    ]
+  },
+  {
+    "key": "custom-dns-enabled",
+    "title": "Enable Custom DNS",
+    "description": "Enable custom DNS server for resolving addresses",
+    "defaultValue": false,
+    "type": "checkbox"
+  },
+  {
+    "key": "custom-dns-address",
+    "title": "Custom DNS Server Address",
+    "description": "IP address of the custom DNS server",
+    "defaultValue": "10.110.1.216",
+    "type": "text",
+    "dependency": "custom-dns-enabled"
+  },
+  {
+    "group": "dependent-preferences",
+    "title": "Dependent preferences",
+    "description": "Dependent preferences group description",
+    "preferences": [
+      {
+        "key": "test-number-d",
+        "title": "Test Preference (number) dependent on 'test-check'",
+        "description": "Number Test-C Preference Description",
+        "type": "number",
+        "dependency": "test-check"
+      }
+    ]
+  }
+]
