@@ -1,514 +1,400 @@
 package io.github.krlvm.powertunnel.plugins.cache;
 
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
-import java.io.Serializable;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.time.Instant;
-import java.util.Arrays;
-import java.util.Base64;
-import java.util.concurrent.ConcurrentHashMap;
-
+import io.github.krlvm.powertunnel.sdk.http.HttpHeaders;
 import io.github.krlvm.powertunnel.sdk.http.ProxyRequest;
 import io.github.krlvm.powertunnel.sdk.http.ProxyResponse;
-import io.github.krlvm.powertunnel.sdk.plugin.PowerTunnelPlugin;
 import io.github.krlvm.powertunnel.sdk.proxy.ProxyAdapter;
 import io.github.krlvm.powertunnel.sdk.proxy.ProxyServer;
-import io.github.krlvm.powertunnel.sdk.types.FullAddress;
+import io.github.krlvm.powertunnel.sdk.plugin.PowerTunnelPlugin;
+
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.*;
+import java.nio.file.*;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.Set;
+import java.util.HashMap;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.*;
+import java.util.Base64;
+
 public class CachePlugin extends PowerTunnelPlugin {
-    private static final Logger LOGGER = LoggerFactory.getLogger(CachePlugin.class);
-    private static final long DEFAULT_TTL = 3600000; // 1 hour in milliseconds
-    private static final String[] CACHEABLE_EXTENSIONS = {
-        // Static web assets
-        "html", "htm", "css", "js", "jpg", "jpeg", "png", "gif", "ico", "svg", "woff", "woff2", "ttf", "eot",
-        // Video formats
-        "mp4", "m4v", "m4s", "ts", "m3u8", "mpd", "mkv", "webm", "avi", "mov", "wmv", "flv", "f4v",
-        // Audio formats
-        "mp3", "aac", "m4a", "ogg", "wav"
-    };
+    // Per-connection request tracking
+    private ProxyRequest currentRequest;
+    private static final Logger LOGGER = LoggerFactory.getLogger("PowerTunnelCache");
+
+    private static final Set<String> CACHEABLE_EXTENSIONS = new HashSet<>(Arrays.asList(
+        "jpg", "jpeg", "png", "gif", "webp", "ico", "bmp",  // Images
+        "mp4", "webm", "m4v", "mkv", "avi", "mov",  // Videos
+        "mp3", "m4a", "ogg", "wav", "flac",                           // Audio
+        "js", "css", "woff", "woff2", "ttf", "eot",           // Web assets
+        "bin", "dat", "iso"                                      // Binary files
+    ));
 
 
-
-    private ConcurrentHashMap<String, CacheEntry> memoryCache;
-    private ConcurrentHashMap<String, ProxyRequest> activeRequests;
     private Path cacheDir;
-    
+
+    private static class CacheEntry implements Serializable {
+        private static final long serialVersionUID = 1L;
+
+        private final byte[] content;
+        private final String contentType;
+        private final String contentEncoding;
+        private final String etag;
+        // Fields are accessed directly by the plugin code
+
+        CacheEntry(byte[] content, String contentType, String contentEncoding, String etag) {
+            this.content = content;
+            this.contentType = contentType;
+            this.contentEncoding = contentEncoding;
+            this.etag = etag;
+        }
+    }
+
     private String generateCacheKey(String url) {
         try {
+            // Normalize URL by removing trailing slashes and fragments
+            url = url.replaceAll("/+$", "").replaceAll("#.*$", "");
+            
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(url.getBytes(StandardCharsets.UTF_8));
-            return Base64.getUrlEncoder().encodeToString(hash);
+            byte[] urlBytes = url.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] hash = digest.digest(urlBytes);
+            return java.util.Base64.getUrlEncoder().encodeToString(hash);
         } catch (NoSuchAlgorithmException e) {
-            LOGGER.error("Failed to generate cache key", e);
-            return Base64.getUrlEncoder().encodeToString(url.getBytes(StandardCharsets.UTF_8));
+            LOGGER.error("[CACHE] Failed to generate cache key: {} ===", e.getMessage());
+            return java.util.Base64.getUrlEncoder().encodeToString(url.getBytes(java.nio.charset.StandardCharsets.UTF_8));
         }
+    }
+
+    private String getFullUrl(ProxyRequest request) {
+        String uri = request.getUri();
+        String host = request.headers().get("Host");
+        
+        // Handle CONNECT requests
+        if ("CONNECT".equalsIgnoreCase(request.getMethod().toString())) {
+            // For CONNECT, the URI is typically host:port
+            return uri;
+        }
+        
+        // Handle absolute URLs
+        if (uri.startsWith("http://") || uri.startsWith("https://")) {
+            return uri;
+        }
+        
+        // Handle case where host is null or empty
+        if (host == null || host.isEmpty()) {
+            // Try to extract host from URI if it's in the form host:port
+            if (uri.contains(":")) {
+                host = uri.split(":")[0];
+            } else {
+                LOGGER.error("[CACHE] No host found in request headers or URI ===");
+                return uri;
+            }
+        }
+        
+        // Construct full URL from host and relative URI
+        // Default to http:// since we can't reliably detect HTTPS
+        return "http://" + host + (uri.startsWith("/") ? uri : "/" + uri);
     }
 
     private void saveToDisk(String cacheKey, CacheEntry entry) {
         if (cacheDir == null) {
-            LOGGER.warn("=== CachePlugin: [CACHE ERROR] Directory not initialized, cannot save to disk for key {} ===", cacheKey);
+            LOGGER.warn("[CACHE] [CACHE ERROR] Directory not initialized, cannot save to disk for key {} ===", cacheKey);
             return;
         }
 
-        LOGGER.warn("=== CachePlugin: [CACHE SAVE] Saving to disk - Size: {} bytes, Type: {} ===", 
+        LOGGER.warn("[CACHE] [CACHE SAVE] Starting save to disk - Size: {} bytes, Type: {} ===", 
             entry.content.length, entry.contentType);
 
         Path filePath = getCacheFilePath(cacheKey);
-        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(filePath.toFile()))) {
-            oos.writeObject(entry);
-            LOGGER.warn("=== CachePlugin: [CACHE SAVE] Successfully saved to disk at {} ===", filePath);
-        } catch (IOException e) {
-            LOGGER.error("=== CachePlugin: [CACHE ERROR] Failed to save to disk with key: {} ===", cacheKey, e);
-        }
-    }
-
-
-
-    private CacheEntry getCachedResponse(String cacheKey) {
-        LOGGER.warn("=== CachePlugin: [CACHE CHECK] Looking for cache key: {} ===", cacheKey);
-        
-        // First try memory cache
-        CacheEntry entry = memoryCache.get(cacheKey);
-        if (entry != null) {
-            LOGGER.warn("=== CachePlugin: [CACHE HIT] Found in memory cache! Size: {} bytes, Type: {} ===", 
-                entry.content.length, entry.contentType);
-        }
-        
-        // If not in memory, try disk cache
-        if (entry == null) {
-            LOGGER.warn("=== CachePlugin: [CACHE CHECK] Not found in memory cache, checking disk... ===");
-            entry = loadFromDisk(cacheKey);
-            if (entry != null) {
-                LOGGER.warn("=== CachePlugin: [CACHE HIT] Found in disk cache! Size: {} bytes, Type: {} ===", 
-                    entry.content.length, entry.contentType);
-                // Put back in memory cache for faster access
-                memoryCache.put(cacheKey, entry);
-            } else {
-                LOGGER.warn("=== CachePlugin: [CACHE MISS] Not found in disk cache ===");
+        Path tempPath = null;
+        try {
+            // Create parent directories if they don't exist
+            Files.createDirectories(filePath.getParent());
+            
+            // Write to a temporary file first
+            tempPath = filePath.resolveSibling(filePath.getFileName() + ".tmp");
+            LOGGER.warn("[CACHE] [CACHE SAVE] Writing to temp file: {} ===", tempPath);
+            
+            try (FileOutputStream fos = new FileOutputStream(tempPath.toFile());
+                 ObjectOutputStream oos = new ObjectOutputStream(fos)) {
+                oos.writeObject(entry);
+                oos.flush();
+                fos.getFD().sync(); // Force write to disk
+                
+                // Atomic rename to final path
+                LOGGER.warn("[CACHE] [CACHE SAVE] Moving temp file to final path ===");
+                Files.move(tempPath, filePath, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                                                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                LOGGER.warn("[CACHE] [CACHE SAVE] Successfully saved to disk at {} ===", filePath);
+            }
+        } catch (Exception e) {
+            LOGGER.error("[CACHE] [CACHE ERROR] Error saving cache entry: {} ===", e.getMessage());
+            LOGGER.error("[CACHE] [CACHE ERROR] Full stack trace: ===", e);
+            if (tempPath != null) {
+                try {
+                    Files.deleteIfExists(tempPath);
+                    LOGGER.warn("[CACHE] [CACHE CLEANUP] Deleted temp file after error ===");
+                } catch (IOException ex) {
+                    LOGGER.error("[CACHE] [CACHE ERROR] Error deleting temp file: {} ===", ex.getMessage());
+                    LOGGER.error("[CACHE] [CACHE ERROR] Full stack trace: ===", ex);
+                }
             }
         }
-        
-        // Check if entry is expired
-        if (entry != null && entry.isExpired()) {
-            LOGGER.warn("=== CachePlugin: [CACHE EXPIRED] Cache entry expired for key {} ===", cacheKey);
-            entry = null;
-        }
-        
-        return entry;
     }
 
-    private static class CacheEntry implements Serializable {
-        private static final long serialVersionUID = 1L;
-        
-        private final byte[] content;
-        private final String contentType;
-        private final String contentEncoding;
-        private final Instant timestamp;
-        private final String etag;
-        private final long ttl; // TTL in milliseconds
-        
-        public CacheEntry(byte[] content, String contentType, String contentEncoding, String etag, long ttl) {
-            this.content = content;
-            this.contentType = contentType;
-            this.contentEncoding = contentEncoding;
-            this.timestamp = Instant.now();
-            this.etag = etag;
-            this.ttl = ttl;
+    private CacheEntry loadFromDisk(String cacheKey) {
+        Path filePath = getCacheFilePath(cacheKey);
+        if (!Files.exists(filePath)) {
+            LOGGER.debug("[CACHE] Cache file not found: {} ===", filePath);
+            return null;
         }
-        
-        public boolean isExpired() {
-            return Instant.now().isAfter(timestamp.plusMillis(ttl));
+
+        try (FileInputStream fis = new FileInputStream(filePath.toFile());
+             ObjectInputStream ois = new ObjectInputStream(fis)) {
+            LOGGER.warn("[CACHE] [CACHE LOAD] Loading cache entry from {} ===", filePath);
+            CacheEntry entry = (CacheEntry) ois.readObject();
+            LOGGER.warn("[CACHE] [CACHE LOAD] Successfully loaded cache entry ===");
+            return entry;
+        } catch (Exception e) {
+            LOGGER.error("[CACHE] [CACHE ERROR] Error loading cache entry: {} ===", e.getMessage());
+            LOGGER.error("[CACHE] [CACHE ERROR] Full stack trace: ===", e);
+            try {
+                Files.delete(filePath);
+                LOGGER.warn("[CACHE] [CACHE CLEANUP] Deleted corrupted cache file: {} ===", filePath);
+            } catch (IOException ex) {
+                LOGGER.error("[CACHE] [CACHE ERROR] Error deleting corrupted cache file: {} ===", ex.getMessage());
+                LOGGER.error("[CACHE] [CACHE ERROR] Full stack trace: ===", ex);
+            }
+            return null;
         }
     }
 
-    public CachePlugin() {
-        LOGGER.debug("=== CachePlugin: Constructor called ===");
-        // Initialize memory cache
-        memoryCache = new ConcurrentHashMap<>();
-        activeRequests = new ConcurrentHashMap<>();
+    private Path getCacheFilePath(String cacheKey) {
+        // Create a two-level directory structure based on the first 4 chars of the key
+        // This helps distribute files across directories to avoid too many files in one dir
+        String encodedKey = Base64.getUrlEncoder().encodeToString(cacheKey.getBytes(StandardCharsets.UTF_8));
+        String level1 = encodedKey.substring(0, 2);
+        String level2 = encodedKey.substring(2, 4);
+        return Paths.get(cacheDir.toString(), level1, level2, encodedKey);
     }
 
     @Override
-    public void onProxyInitialization(@NotNull ProxyServer proxy) {
-        LOGGER.info("=== CachePlugin: [1/4] Initializing cache plugin ===");
-        memoryCache = new ConcurrentHashMap<>();
-        activeRequests = new ConcurrentHashMap<>();
+    public void onProxyInitialization(@NotNull ProxyServer server) {
+        // Initialize cache directory
+        try {
+            String androidDataDir = System.getProperty("java.io.tmpdir");
+            if (androidDataDir == null) {
+                androidDataDir = System.getProperty("user.home");
+            }
+            cacheDir = Paths.get(androidDataDir, "powertunnel-cache");
+            Files.createDirectories(cacheDir);
+            LOGGER.info("[CACHE] Cache directory: {} ===", cacheDir);
+        } catch (Exception e) {
+            LOGGER.error("[CACHE] Failed to create cache directory: {} ===", e.getMessage());
+            return;
+        }
 
-        // Register our proxy listener
-        this.registerProxyListener(new ProxyAdapter() {
+        // Add proxy adapter for request/response handling
+        registerProxyListener(new ProxyAdapter() {
             @Override
             public void onClientToProxyRequest(@NotNull ProxyRequest request) {
-                // Log ALL requests, regardless of caching rules
-                String url = request.getUri();
-                LOGGER.warn("=== CachePlugin: RAW REQUEST: {} {} ===", 
-                          request.getMethod(), 
-                          url);
-                LOGGER.warn("=== CachePlugin: Headers: {} ===",
+                LOGGER.warn("[CACHE] [1/4] onClientToProxyRequest - Thread: {} ===", Thread.currentThread().getName());
+                // Store request for correlation with response
+                currentRequest = request;
+                
+                // Get full URL including host
+                String fullUrl = getFullUrl(request);
+                
+                // Log request details
+                LOGGER.warn("[CACHE] RAW REQUEST: {} {} ===", 
+                          request.getMethod(),
+                          fullUrl);
+                LOGGER.warn("[CACHE] Headers: {} ===",
                           request.headers());
                 
-                // Log potential video URLs
-                if (url.contains("/Items/") || url.contains("/Video") || 
-                    url.contains("/Stream") || url.contains("/PlaybackInfo") || 
-                    url.contains("/Download") || url.contains("/Audio") || 
-                    url.contains("/hls/") || url.contains(".m3u8") || 
-                    url.contains(".ts") || url.contains(".mp4")) {
-                    LOGGER.warn("=== CachePlugin: POTENTIAL VIDEO REQUEST FOUND: {} ===", url);
+                // Check if request is cacheable
+                if (!isCacheable(request)) {
+                    LOGGER.warn("[CACHE] Request not cacheable: {} ===", fullUrl);
+                    return;
+                }
+                
+                // Try to load from cache using full URL
+                String cacheKey = generateCacheKey(fullUrl);
+                CacheEntry entry = loadFromDisk(cacheKey);
+                
+                if (entry == null) {
+                    LOGGER.warn("[CACHE] Cache miss: {} ===", fullUrl);
+                    return;
+                }
+                
+                // Check If-None-Match header
+                String ifNoneMatch = request.headers().get("If-None-Match");
+                String etag = entry.etag;
+                
+                if (ifNoneMatch != null && etag != null && ifNoneMatch.equals(etag)) {
+                    LOGGER.warn("[CACHE] 304 Not Modified: {} ===", fullUrl);
+                    ProxyResponse response = server.getResponseBuilder(null)
+                        .code(304)
+                        .header("ETag", etag)
+                        .header("X-Cache", "HIT")
+                        .build();
+                    request.setResponse(response);
+                    return;
+                }
+                
+                // Serve from cache
+                byte[] content = entry.content;
+                ProxyResponse.Builder responseBuilder = server.getResponseBuilder(new String(content, StandardCharsets.UTF_8))
+                    .code(200)
+                    .contentType(entry.contentType)
+                    .header("Content-Length", String.valueOf(content.length))
+                    .header("X-Cache", "HIT");
+                
+                if (entry.contentEncoding != null) {
+                    responseBuilder.header("Content-Encoding", entry.contentEncoding);
+                }
+                
+                if (entry.etag != null) {
+                    responseBuilder.header("ETag", entry.etag);
+                }
+                
+                ProxyResponse response = responseBuilder.build();
+                request.setResponse(response);
+                LOGGER.warn("[CACHE] Served from cache: {} ({} bytes) ===", fullUrl, content.length);
+                
+                // Important: Return immediately after serving from cache to avoid further processing
+                return;
+            }
+            
+            @Override
+            public void onProxyToServerRequest(@NotNull ProxyRequest request) {
+                try {
+                    LOGGER.warn("[CACHE] [2/4] onProxyToServerRequest - Thread: {} ===", Thread.currentThread().getName());
+                    String originalUrl = getFullUrl(currentRequest);  // Use stored request
+                    LOGGER.warn("[CACHE] [2/4] URL from stored request: {} ===", originalUrl);
+                    if (originalUrl != null && !originalUrl.isEmpty()) {
+                        LOGGER.warn("[CACHE] Propagating URL to server request: {} ===", originalUrl);
+                    }
+                } catch (Exception e) {
+                    LOGGER.error("[CACHE] Error in onProxyToServerRequest: {} ===", e.getMessage(), e);
+                }
+            }
+            
+            @Override
+            public void onServerToProxyResponse(@NotNull ProxyResponse response) {
+                try {
+                    LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse ENTRY - Thread: {} ===", Thread.currentThread().getName());
+                    // Get URL from stored request
+                    String originalUrl = getFullUrl(currentRequest);
+                    LOGGER.warn("[CACHE] [3/4] URL from stored request: {} ===", originalUrl);
+                    LOGGER.warn("[CACHE] [3/4] Response code: {} ===", response.code());
+
+                    LOGGER.warn("[CACHE] [3/4] All response headers: {} ===", response.headers());
+                    LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse EXIT ===");
+                } catch (Exception e) {
+                    LOGGER.error("[CACHE] Error in onServerToProxyResponse: {} ===", e.getMessage(), e);
                 }
             }
             
             @Override
             public void onProxyToClientResponse(@NotNull ProxyResponse response) {
-                FullAddress address = response.address();
-                if (address == null) {
-                    LOGGER.warn("=== CachePlugin: No address in response ===");
-                    return;
-                }
-                String url = address.toString();
-                
-                // Log ALL responses
-                LOGGER.warn("=== CachePlugin: RAW RESPONSE for {}: {} {} ===",
-                  url,
-                  response.code(),
-                  response.headers());
-                
-                // Only cache successful responses (200 OK) and partial content (206)
-                if (response.code() != 200 && response.code() != 206) {
-                    LOGGER.warn("=== CachePlugin: Not caching response with code {}: not 200 or 206 ===", response.code());
-                    return;
-                }
+                try {
+                    LOGGER.warn("[CACHE] [4/4] onProxyToClientResponse ENTRY - Thread: {} ===", Thread.currentThread().getName());
+                    LOGGER.warn("[CACHE] [4/4] Response code: {} ===", response.code());
 
-                // For 206 responses, only cache if we have the full content range
-                if (response.code() == 206) {
-                    String contentRange = response.headers().get("Content-Range");
-                    if (contentRange == null) {
-                        LOGGER.warn("=== CachePlugin: Not caching 206 response - missing Content-Range header ===");
+                    LOGGER.warn("[CACHE] [4/4] All response headers: {} ===", response.headers());
+                    // Skip if this was a cache hit
+                    if ("HIT".equals(response.headers().get("X-Cache"))) {
+                        LOGGER.warn("[CACHE] Skipping cache storage for cache hit ===");
                         return;
                     }
-                    LOGGER.info("=== CachePlugin: DEBUG - Parsing Content-Range: {} ===", contentRange);
-                    try {
-                        String[] parts = contentRange.split(" ")[1].split("/");
-                        LOGGER.info("=== CachePlugin: DEBUG - After first split: parts[1]={} ===", parts[1]);
-                        String[] range = parts[0].split("-");
-                        LOGGER.info("=== CachePlugin: DEBUG - Range parts: start={}, end={} ===", range[0], range[1]);
-                        long start = Long.parseLong(range[0]);
-                        long end = Long.parseLong(range[1]);
-                        long total = Long.parseLong(parts[1]);
-                        LOGGER.info("=== CachePlugin: DEBUG - Parsed values: start={}, end={}, total={} ===", start, end, total);
-                        
-                        // Only cache if this is the complete file
-                        if (start != 0 || end + 1 != total) {
-                            LOGGER.warn("=== CachePlugin: Not caching partial 206 response - range {}-{}/{} ===", start, end, total);
-                            return;
-                        }
-                        LOGGER.info("=== CachePlugin: Caching complete 206 response - got full content {}-{}/{} ===", start, end, total);
-                    } catch (Exception e) {
-                        LOGGER.warn("=== CachePlugin: Not caching 206 response - invalid Content-Range header: {} ===", contentRange);
-                        return;
-                    }
-                }
-
-                // Get response details
-                String contentType = response.headers().get("Content-Type");
-                String contentEncoding = response.headers().get("Content-Encoding");
-                String etag = response.headers().get("ETag");
-                byte[] content = response.content();
-
-                if (content == null || content.length == 0) {
-                    LOGGER.warn("=== CachePlugin: Not caching empty response for: {} ===", url);
-                    return;
-                }
-
-                // Create cache entry
-                String cacheKey = generateCacheKey(url);
-                CacheEntry entry = new CacheEntry(content, contentType, contentEncoding, etag, DEFAULT_TTL);
-
-                // Save to memory and disk
-                memoryCache.put(cacheKey, entry);
-                saveToDisk(cacheKey, entry);
-
-                LOGGER.warn("=== CachePlugin: Cached response for {}: {} bytes, type {} ===",
-                  url,
-                  content.length,
-                  contentType);
-            }
-        });
-
-        // Initialize cache directory
-        try {
-            String cacheBasePath = readConfiguration().get("cache_dir", System.getProperty("java.io.tmpdir") + "/powertunnel-cache");
-            cacheDir = Files.createDirectories(Paths.get(cacheBasePath));
-            LOGGER.warn("=== CachePlugin: Created cache directory at: {} ===", cacheDir);
-        } catch (IOException e) {
-            LOGGER.error("=== CachePlugin: Failed to create cache directory ===", e);
-            // Set a default cache directory in case of failure
-            cacheDir = Paths.get(System.getProperty("java.io.tmpdir"), "powertunnel-cache");
-            try {
-                Files.createDirectories(cacheDir);
-                LOGGER.warn("=== CachePlugin: Created fallback cache directory at: {} ===", cacheDir);
-            } catch (IOException ex) {
-                LOGGER.error("=== CachePlugin: Failed to create fallback cache directory ===", ex);
-            }
-        }
-        
-        // Load existing cache entries from disk
-        proxy.setFullRequest(true);
-
-        this.registerProxyListener(new ProxyAdapter() {
-            @Override
-            public void onClientToProxyRequest(@NotNull ProxyRequest request) {
-                // Log ALL requests that come through the proxy
-                LOGGER.warn("=== CachePlugin: ALL REQUEST: {} {} with headers {} ===",
-                          request.getMethod(), request.getUri(), request.headers());
-
-                // Check if the request is cacheable
-                if (!isCacheable(request)) {
-                    return;
-                }
-
-                String cacheKey = generateCacheKey(request.getUri());
-                activeRequests.put(cacheKey, request);
-
-                LOGGER.info("=== CachePlugin: [3/4] Looking for cached response for {} ===", request.getUri());
-                LOGGER.info("  Method: {}", request.getMethod());
-                LOGGER.info("  URI: {}", request.getUri());
-                LOGGER.info("  Host: {}", request.headers().get("Host"));
-                LOGGER.info("  Cache-Control: {}", request.headers().get("Cache-Control"));
-                LOGGER.info("  Pragma: {}", request.headers().get("Pragma"));
-                LOGGER.info("  If-None-Match: {}", request.headers().get("If-None-Match"));
-                LOGGER.info("  If-Modified-Since: {}", request.headers().get("If-Modified-Since"));
-
-                String url = request.getUri();
-                CacheEntry cachedResponse = getCachedResponse(cacheKey);
-
-                if (cachedResponse != null) {
-                    // Check if the client sent an If-None-Match header
-                    String ifNoneMatch = request.headers().get("If-None-Match");
-                    if (ifNoneMatch != null && ifNoneMatch.equals(cachedResponse.etag)) {
-                        // Return 304 Not Modified
-                        ProxyResponse notModifiedResponse = getServer().getProxyServer().getResponseBuilder("", 304).build();
-                        request.setResponse(notModifiedResponse);
-                        LOGGER.debug("=== CachePlugin: Returning 304 Not Modified for {} ===", url);
-                        return;
-                    }
-
-                    // Return cached response
-                    LOGGER.info("=== CachePlugin: [3/4] Cache hit! Serving cached response for {} ===", url);
-                    ProxyResponse response = getServer().getProxyServer().getResponseBuilder("", 200)
-                        .contentType(cachedResponse.contentType)
-                        .build();
                     
-                    response.setContent(cachedResponse.content);
-                    
-                    if (cachedResponse.contentEncoding != null) {
-                        response.headers().set("Content-Encoding", cachedResponse.contentEncoding);
-                    }
-                    if (cachedResponse.etag != null) {
-                        response.headers().set("ETag", cachedResponse.etag);
-                    }
-                    request.setResponse(response);
-                    LOGGER.info("=== CachePlugin: [4/4] Cached response served successfully ===");
-                } else {
-                    LOGGER.info("=== CachePlugin: [3/4] Cache miss for {} - will fetch from origin ===", url);
-                    activeRequests.put(cacheKey, request);
-                    LOGGER.info("=== CachePlugin: [4/4] Request forwarded to origin server ===");
-                }
-            }
-
-            @Override
-            public void onProxyToClientResponse(@NotNull ProxyResponse response) {
-                // For 304 Not Modified responses, update the cache entry's timestamp if we have it
-                if (response.code() == 304) {
-                    String url = response.headers().get("X-Original-URI");
-                    if (url != null) {
-                        String cacheKey = generateCacheKey(url);
-                        CacheEntry entry = getCachedResponse(cacheKey);
-                        if (entry != null) {
-                            // Update the entry with new headers if present
-                            String newEtag = response.headers().get("ETag");
-                            if (newEtag != null) {
-                                CacheEntry updatedEntry = new CacheEntry(
-                                    entry.content,
-                                    entry.contentType,
-                                    entry.contentEncoding,
-                                    newEtag,
-                                    entry.ttl
-                                );
-                                memoryCache.put(cacheKey, updatedEntry);
-                                saveToDisk(cacheKey, updatedEntry);
-                                LOGGER.info("=== CachePlugin: Updated cache entry for {} with new ETag ===", url);
-                            }
-                        }
-                    }
-                }
-                LOGGER.info("=== CachePlugin: [3/4] Response status: {} ===", response.code());
-                LOGGER.info("=== CachePlugin: Response headers: {} ===", response.headers().toString());
-                // Get the original URL from the request
-                String url = response.headers().get("X-Original-URI");
-                if (url == null) {
-                    // Try to get it from the Host and path
-                    String host = response.headers().get("Host");
-                    String path = response.headers().get("Path");
-                    if (host != null && path != null) {
-                        url = "http://" + host + path;
-                    } else {
-                        LOGGER.debug("=== CachePlugin: No URL found in response headers ===");
+                    // Get URL from stored request
+                    String fullUrl = getFullUrl(currentRequest);
+                    if (fullUrl == null || fullUrl.isEmpty()) {
+                        LOGGER.error("[CACHE] No URL from stored request, skipping cache ===");
                         return;
                     }
-                }
-
-                String cacheKey = CachePlugin.this.generateCacheKey(url);
-                ProxyRequest request = activeRequests.remove(cacheKey);
-
-                if (request != null) {
-                    // Check if response is cacheable
-                    String cacheControl = response.headers().get("Cache-Control");
-                    if (cacheControl != null) {
-                        String lowerCaseControl = cacheControl.toLowerCase();
-                        if (lowerCaseControl.contains("no-store") || 
-                            lowerCaseControl.contains("no-cache") || 
-                            lowerCaseControl.contains("private")) {
-                            LOGGER.debug("=== CachePlugin: Not caching due to Cache-Control: {} ===", cacheControl);
-                            return;
-                        }
+                    
+                    // Add cache status header
+                    response.headers().set("X-Cache", "MISS");
+                    
+                    // Get response code
+                    int responseCode = response.code();
+                    if (responseCode != 200) {
+                        LOGGER.warn("[CACHE] Non-200 response code {} for {} ===",
+                          responseCode,
+                          fullUrl);
+                        return;
                     }
-
-                    // Get TTL from Cache-Control header
-                    long ttl = DEFAULT_TTL;
-                    if (cacheControl != null) {
-                        String[] directives = cacheControl.split(",");
-                        for (String directive : directives) {
-                            directive = directive.trim().toLowerCase();
-                            if (directive.startsWith("max-age=")) {
-                                try {
-                                    ttl = Long.parseLong(directive.substring(8)) * 1000L;
-                                    if (ttl <= 0) {
-                                        LOGGER.debug("=== CachePlugin: Not caching due to zero/negative max-age ===");
-                                        return;
-                                    }
-                                    break;
-                                } catch (NumberFormatException e) {
-                                    LOGGER.warn("=== CachePlugin: Invalid max-age value in Cache-Control: {} ===", directive);
-                                }
-                            }
-                        }
+                    
+                    // Get response headers case-insensitively
+                    Map<String,String> headers = new HashMap<>();
+                    HttpHeaders httpHeaders = response.headers();
+                    for (String name : httpHeaders.names()) {
+                        // Store both original and lowercase keys for case-insensitive lookup
+                        headers.put(name.toLowerCase(), httpHeaders.get(name));
                     }
-
-                    // Get response content and headers
+                    
+                    String contentType = headers.get("content-type");
+                    String contentEncoding = headers.get("content-encoding");
+                    String etag = headers.get("etag");
+                    String contentLength = headers.get("content-length");
+                    
+                    // Validate response
+                    if (contentType == null || contentLength == null) {
+                        LOGGER.warn("[CACHE] Missing required headers ===");
+                        return;
+                    }
+                    
+                    // Get response body
                     byte[] content = response.content();
-                    if (content == null) {
-                        content = new byte[0];
-                    }
-
-                    String contentType = response.headers().get("Content-Type");
-                    String contentEncoding = response.headers().get("Content-Encoding");
-                    String etag = response.headers().get("ETag");
-                    String contentRange = response.headers().get("Content-Range");
-                    
-                    if (contentRange != null) {
-                        LOGGER.info("=== CachePlugin: Content-Range header present: {} ===", contentRange);
-                    }
-
-                    // Cache the response
-                    // Use longer TTL for video content
-                    if (contentType != null && (
-                        contentType.startsWith("video/") || 
-                        contentType.contains("mpegurl") || 
-                        contentType.contains("mp2t") ||
-                        contentType.contains("dash+xml"))) {
-                        LOGGER.info("=== CachePlugin: Using extended TTL for video content ===");
-                        ttl = DEFAULT_TTL * 24; // 24 hours for video content
+                    if (content == null || content.length == 0) {
+                        LOGGER.error("[CACHE] Empty response body ===");
+                        return;
                     }
                     
-                    CacheEntry entry = new CacheEntry(response.content(), contentType, contentEncoding, etag, ttl);
-                    memoryCache.put(cacheKey, entry);
+                    // Temporarily disabled caching logic for testing
+                    /*
+                    // Create cache entry
+                    CacheEntry entry = new CacheEntry(content, contentType, contentEncoding, etag);
+                    
+                    // Save to disk using full URL as key
+                    String cacheKey = generateCacheKey(fullUrl);
                     saveToDisk(cacheKey, entry);
-                    LOGGER.debug("=== CachePlugin: Cached response for {} (type={}, size={}, ttl={}ms) ===", 
-                        url, contentType, content.length, ttl);
+                    */
+                    LOGGER.warn("[CACHE] Response received: {} ({} bytes, type: {}) ===", 
+                      fullUrl, content.length, contentType);
+                } catch (Exception e) {
+                    LOGGER.error("[CACHE] Error in onProxyToClientResponse: {} ===", e.getMessage(), e);
                 }
             }
         });
-    }
-
-    
-    private CacheEntry loadFromDisk(String cacheKey) {
-        try {
-            Path filePath = getCacheFilePath(cacheKey);
-            if (Files.exists(filePath)) {
-                try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(filePath.toFile()))) {
-                    CacheEntry entry = (CacheEntry) ois.readObject();
-                    LOGGER.debug("=== CachePlugin: Loaded from disk with key: {} ===", cacheKey);
-                    return entry;
-                }
-            }
-        } catch (IOException | ClassNotFoundException e) {
-            LOGGER.error("=== CachePlugin: Failed to load from disk with key: {} ===", cacheKey, e);
-        }
-        return null;
-    }
-    
-    private void deleteCacheFile(String cacheKey) {
-        try {
-            Path filePath = getCacheFilePath(cacheKey);
-            Files.deleteIfExists(filePath);
-            LOGGER.debug("=== CachePlugin: Deleted cache file with key: {} ===", cacheKey);
-        } catch (IOException e) {
-            LOGGER.error("=== CachePlugin: Failed to delete cache file with key: {} ===", cacheKey, e);
-        }
-    }
-    
-    private Path getCacheFilePath(String cacheKey) {
-        return Paths.get(cacheDir.toString(), Base64.getUrlEncoder().encodeToString(cacheKey.getBytes(StandardCharsets.UTF_8)));
-    }
-    
-    private void loadCacheFromDisk() {
-        if (!Files.exists(cacheDir)) {
-            return;
-        }
-        
-        try {
-            Files.list(cacheDir).forEach(file -> {
-                String url = file.getFileName().toString().replaceAll("_", "/");
-                CacheEntry entry = loadFromDisk(url);
-                if (entry != null && !entry.isExpired()) {
-                    memoryCache.put(url, entry);
-                    LOGGER.debug("=== CachePlugin: Loaded cache entry for {} from disk ===", url);
-                } else if (entry != null) {
-                    deleteCacheFile(url);
-                    LOGGER.debug("=== CachePlugin: Deleted expired cache entry for {} ===", url);
-                }
-            });
-        } catch (IOException e) {
-            LOGGER.error("=== CachePlugin: Failed to load cache from disk ===", e);
-        }
     }
 
     private boolean isCacheable(ProxyRequest request) {
-        String url = request.getUri().toLowerCase();
         String method = request.getMethod().toString();
-        LOGGER.warn("=== CachePlugin: Received request: {} {} ===", method, url);
-        LOGGER.warn("=== CachePlugin: Headers: {} ===", request.headers());
-
-        // Handle CONNECT requests for HTTPS
+        String url = getFullUrl(request);
+        
+        // Allow caching for CONNECT requests to known static content hosts
         if ("CONNECT".equalsIgnoreCase(method)) {
-            LOGGER.info("=== CachePlugin: Not cacheable - CONNECT request for {} ===", url);
+            String host = request.headers().get("Host");
+            if (host != null && (host.equals("example.com:443") || host.startsWith("10.0.2.2:"))) {
+                LOGGER.warn("[CACHE] Allowing cache for trusted HTTPS host: {}", url);
+                return true;
+            }
+            LOGGER.warn("[CACHE] Not cacheable - CONNECT request for {}", url);
             return false;
         }
 
-        // Check if it's a GET request
+        // Only cache GET requests
         if (!"GET".equalsIgnoreCase(method)) {
-            LOGGER.info("=== CachePlugin: Not cacheable - non-GET request: {} {} ===", method, url);
+            LOGGER.info("[CACHE] Not cacheable - non-GET request: {} ===", method);
             return false;
         }
 
@@ -516,66 +402,33 @@ public class CachePlugin extends PowerTunnelPlugin {
         if (url.contains("/items/")) {
             // Check for theme media or direct video content
             if (url.contains("/thememedia") || url.contains("/download")) {
-                LOGGER.warn("=== CachePlugin: Cacheable - Jellyfin video content: {} ===", url);
-                LOGGER.warn("=== CachePlugin: Content-Type: {} ===", request.headers().get("Content-Type"));
-                LOGGER.warn("=== CachePlugin: Range: {} ===", request.headers().get("Range"));
+                LOGGER.warn("[CACHE] Cacheable - Jellyfin video content: {} ===", url);
+                LOGGER.warn("[CACHE] Content-Type: {} ===", request.headers().get("Content-Type"));
+                LOGGER.warn("[CACHE] Range: {} ===", request.headers().get("Range"));
                 return true;
             }
             
             // Check for video segments and manifests
-            if ((url.contains("/videos/") || url.contains("/audio/") || 
-                url.contains("/videostream") || url.contains("/playbackinfo") || url.contains("/stream") ||
-                url.contains("/universal") || url.contains("/master.m3u8") ||
-                url.contains("/manifest") || url.contains("/segments/") || url.contains(".ts") ||
-                url.contains(".m4s") || url.contains(".mpd")) &&
-                !url.contains("/sessions/") && !url.contains("/playing") && !url.contains("/users/")) {
-                
-                if (url.endsWith(".ts") || url.endsWith(".m4s") || url.endsWith(".mpd") || url.endsWith(".m3u8")) {
-                    LOGGER.info("=== CachePlugin: Cacheable - Jellyfin media segment: {} ===", url);
-                    LOGGER.info("=== CachePlugin: Content-Type: {} ===", request.headers().get("Content-Type"));
-                    LOGGER.info("=== CachePlugin: Range: {} ===", request.headers().get("Range"));
-                    return true;
-                }
+            if (url.contains("/videos/") || url.contains("/audio/") || 
+                url.contains("/videostream") || url.contains("/playbackinfo") || 
+                url.contains("/stream") || url.contains("/universal") || 
+                url.contains("/master.m3u8") || url.contains("/manifest") || 
+                url.contains("/segments/") || url.contains(".ts") || 
+                url.contains(".m4s") || url.contains(".mpd")) {
+                LOGGER.info("[CACHE] Cacheable - Jellyfin media segment: {} ===", url);
+                return true;
             }
-            LOGGER.debug("=== CachePlugin: Not a cacheable media segment: {} ===", url);
         }
 
         // Check file extension
-        int dotIndex = url.lastIndexOf(".");
-        int slashIndex = url.lastIndexOf("/");
-        int queryIndex = url.indexOf("?");
-        
-        if (dotIndex > slashIndex && dotIndex < url.length() - 1) {
-            String extension;
-            if (queryIndex > dotIndex) {
-                extension = url.substring(dotIndex + 1, queryIndex);
-            } else {
-                extension = url.substring(dotIndex + 1);
-            }
-            
-            LOGGER.debug("=== CachePlugin: Checking extension: {} ===", extension);
-            if (Arrays.asList(CACHEABLE_EXTENSIONS).contains(extension.toLowerCase())) {
-                LOGGER.info("=== CachePlugin: Cacheable - URL has valid extension: {} ===", extension);
-                return true;
-            }
-        }
-
-        // Handle URLs with query parameters
-        if (queryIndex != -1) {
-            // Allow query parameters for video-related URLs
-            if (url.contains("/items/") || url.contains("/videos/") || url.contains("/audio/") || 
-                url.contains("/videostream") || url.contains("/playbackinfo") || url.contains("/stream") ||
-                url.contains("/download") || url.contains("/universal") || url.contains("/master.m3u8") ||
-                url.contains("/manifest") || url.contains("/segments/")) {
-                LOGGER.info("=== CachePlugin: Allowing query parameters for video URL: {} ===", url);
-                return true;
-            }
-            LOGGER.info("=== CachePlugin: Not cacheable - URL has query parameters: {} ===", url);
+        try {
+            int dotIndex = url.lastIndexOf('.');
+            if (dotIndex == -1) return false;
+            String extension = url.substring(dotIndex + 1).toLowerCase();
+            return CACHEABLE_EXTENSIONS.contains(extension);
+        } catch (Exception e) {
+            LOGGER.error("[CACHE] Error checking cacheability: {} ===", e.getMessage());
             return false;
         }
-
-        // Default to not caching if no explicit conditions are met
-        LOGGER.info("=== CachePlugin: Not cacheable - No caching conditions met ===");
-        return false;
     }
 }

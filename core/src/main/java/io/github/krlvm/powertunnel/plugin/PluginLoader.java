@@ -72,10 +72,15 @@ public class PluginLoader {
     public static void loadPlugins(File[] files, PowerTunnel server) throws PluginLoadException {
         loadPlugins(files, server, DEFAULT_INJECTOR);
     }
+    private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(PluginLoader.class);
     public static void loadPlugins(File[] files, PowerTunnel server, PluginInjector injector) throws PluginLoadException {
+        LOGGER.warn("=== PluginLoader: Loading plugins ===");
         for (File file : files) {
             if(file.isDirectory()) continue;
-            server.registerPlugin(PluginLoader.loadPlugin(file, injector));
+            LOGGER.warn("=== PluginLoader: Loading plugin {} ===", file.getName());
+            PowerTunnelPlugin plugin = PluginLoader.loadPlugin(file, injector);
+            LOGGER.warn("=== PluginLoader: Registering plugin {} ===", plugin.getInfo().getName());
+            server.registerPlugin(plugin);
         }
     }
 
@@ -147,6 +152,7 @@ public class PluginLoader {
         }
         final Object instance;
         try {
+            LOGGER.warn("=== PluginLoader: Creating instance of {} ===", clazz.getName());
             instance = clazz.newInstance();
         } catch (InstantiationException | IllegalAccessException ex) {
             throw new PluginLoadException(jarName, "Can't instantiate plugin main class", ex);
