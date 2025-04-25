@@ -5,7 +5,6 @@ import io.github.krlvm.powertunnel.sdk.http.ProxyResponse;
 import io.github.krlvm.powertunnel.sdk.proxy.ProxyAdapter;
 import io.github.krlvm.powertunnel.sdk.proxy.ProxyServer;
 import io.github.krlvm.powertunnel.sdk.plugin.PowerTunnelPlugin;
-import io.github.krlvm.powertunnel.sdk.types.FullAddress;
 
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
@@ -39,6 +38,61 @@ public class CachePlugin extends PowerTunnelPlugin {
 
     private Path cacheDir;
 
+    private boolean isCacheable(ProxyRequest request) {
+        String method = request.getMethod().toString();
+        String url = getFullUrl(request);
+        
+        // Allow caching for CONNECT requests to known static content hosts
+        if ("CONNECT".equalsIgnoreCase(method)) {
+            String host = request.headers().get("Host");
+            if (host != null && (host.equals("example.com:443") || host.startsWith("10.0.2.2:"))) {
+                LOGGER.warn("[CACHE] Allowing cache for trusted HTTPS host: {}", url);
+                return true;
+            }
+            LOGGER.warn("[CACHE] Not cacheable - CONNECT request for {}", url);
+            return false;
+        }
+
+        // Only cache GET requests
+        if (!"GET".equalsIgnoreCase(method)) {
+            LOGGER.info("[CACHE] Not cacheable - non-GET request: {} ===", method);
+            return false;
+        }
+
+        // Check if this is a Jellyfin media request
+        if (url.contains("/items/")) {
+            // Check for theme media or direct video content
+            if (url.contains("/thememedia") || url.contains("/download")) {
+                LOGGER.warn("[CACHE] Cacheable - Jellyfin video content: {} ===", url);
+                LOGGER.warn("[CACHE] Content-Type: {} ===", request.headers().get("Content-Type"));
+                LOGGER.warn("[CACHE] Range: {} ===", request.headers().get("Range"));
+                return true;
+            }
+            
+            // Check for video segments and manifests
+            if (url.contains("/videos/") || url.contains("/audio/") || 
+                url.contains("/videostream") || url.contains("/playbackinfo") || 
+                url.contains("/stream") || url.contains("/universal") || 
+                url.contains("/master.m3u8") || url.contains("/manifest") || 
+                url.contains("/segments/") || url.contains(".ts") || 
+                url.contains(".m4s") || url.contains(".mpd")) {
+                LOGGER.info("[CACHE] Cacheable - Jellyfin media segment: {} ===", url);
+                return true;
+            }
+        }
+
+        // Check file extension
+        try {
+            int dotIndex = url.lastIndexOf('.');
+            if (dotIndex == -1) return false;
+            String extension = url.substring(dotIndex + 1).toLowerCase();
+            return CACHEABLE_EXTENSIONS.contains(extension);
+        } catch (Exception e) {
+            LOGGER.error("[CACHE] Error checking cacheability: {} ===", e.getMessage());
+            return false;
+        }
+    }
+
     private static class CacheEntry implements Serializable {
         private static final long serialVersionUID = 1L;
 
@@ -46,7 +100,6 @@ public class CachePlugin extends PowerTunnelPlugin {
         private final String contentType;
         private final String contentEncoding;
         private final String etag;
-        // Fields are accessed directly by the plugin code
 
         CacheEntry(byte[] content, String contentType, String contentEncoding, String etag) {
             this.content = content;
@@ -193,264 +246,267 @@ public class CachePlugin extends PowerTunnelPlugin {
 
     @Override
     public void onProxyInitialization(@NotNull ProxyServer server) {
-        // Initialize cache directory
         try {
-            String cacheDirPath = System.getProperty("user.home") + File.separator + ".powertunnel" + File.separator + "cache";
-            cacheDir = Paths.get(cacheDirPath);
+            // Initialize cache directory
+            cacheDir = Paths.get("/data/data/io.github.krlvm.powertunnel.android.dev/cache/powertunnel");
             Files.createDirectories(cacheDir);
-            LOGGER.warn("[CACHE] Cache directory: {} ===", cacheDir);
-        } catch (Exception e) {
-            LOGGER.error("[CACHE] Failed to create cache directory: {} ===", e.getMessage(), e);
-        }
+            LOGGER.info("[CACHE] Initialized cache directory: {} ===", cacheDir);
 
-        // Register proxy listener
-        registerProxyListener(new ProxyAdapter() {
-        @Override
-        public Integer onGetChunkSize(@NotNull FullAddress address) {
-            Integer chunkSize = super.onGetChunkSize(address);
-            LOGGER.warn("=== [CHUNK] ProxyAdapter.onGetChunkSize called for {} with chunk size {} ===", address, chunkSize);
-            return chunkSize;
-        }
+            this.registerProxyListener(new ProxyAdapter() {
+                @Override
+                public void onClientToProxyRequest(@NotNull ProxyRequest request) {
+                    try {
+                        currentRequest = request;
+                        String fullUrl = getFullUrl(request);
+                        LOGGER.warn("[CACHE] [1/4] onClientToProxyRequest for {} ===", fullUrl);
 
-            @Override
-            public void onClientToProxyRequest(@NotNull ProxyRequest request) {
-                LOGGER.warn("[CACHE] [1/4] onClientToProxyRequest - Thread: {} ===", Thread.currentThread().getName());
-                // Store request for correlation with response
-                currentRequest = request;
-                
-                // Get full URL including host
-                String fullUrl = getFullUrl(request);
-                
-                // Log request details
-                LOGGER.warn("[CACHE] RAW REQUEST: {} {} ===", 
-                          request.getMethod(),
-                          fullUrl);
-                LOGGER.warn("[CACHE] Headers: {} ===",
-                          request.headers());
-                
-                // Check if request is cacheable
-                if (!isCacheable(request)) {
-                    LOGGER.warn("[CACHE] Request not cacheable: {} ===", fullUrl);
-                    return;
-                }
-                
-                // Try to load from cache using full URL
-                String cacheKey = generateCacheKey(fullUrl);
-                CacheEntry entry = loadFromDisk(cacheKey);
-                
-                if (entry == null) {
-                    LOGGER.warn("[CACHE] Cache miss: {} ===", fullUrl);
-                    return;
-                }
-                
-                // Check If-None-Match header
-                String ifNoneMatch = request.headers().get("If-None-Match");
-                String etag = entry.etag;
-                
-                if (ifNoneMatch != null && etag != null && ifNoneMatch.equals(etag)) {
-                    LOGGER.warn("[CACHE] 304 Not Modified: {} ===", fullUrl);
-                    ProxyResponse response = server.getResponseBuilder(null)
-                        .code(304)
-                        .header("ETag", etag)
-                        .header("X-Cache", "HIT")
-                        .build();
-                    request.setResponse(response);
-                    return;
-                }
-                
-                // Serve from cache
-                byte[] content = entry.content;
-                ProxyResponse.Builder responseBuilder = server.getResponseBuilder(new String(content, StandardCharsets.UTF_8))
-                    .code(200)
-                    .contentType(entry.contentType)
-                    .header("Content-Length", String.valueOf(content.length))
-                    .header("X-Cache", "HIT");
-                
-                if (entry.contentEncoding != null) {
-                    responseBuilder.header("Content-Encoding", entry.contentEncoding);
-                }
-                
-                if (entry.etag != null) {
-                    responseBuilder.header("ETag", entry.etag);
-                }
-                
-                ProxyResponse response = responseBuilder.build();
-                request.setResponse(response);
-                LOGGER.warn("[CACHE] Served from cache: {} ({} bytes) ===", fullUrl, content.length);
-                
-                // Important: Return immediately after serving from cache to avoid further processing
-                return;
-            }
-            
-            @Override
-            public void onProxyToServerRequest(@NotNull ProxyRequest request) {
-                try {
-                    LOGGER.warn("[CACHE] [2/4] onProxyToServerRequest - Thread: {} ===", Thread.currentThread().getName());
-                    String originalUrl = getFullUrl(currentRequest);  // Use stored request
-                    LOGGER.warn("[CACHE] [2/4] URL from stored request: {} ===", originalUrl);
-                    if (originalUrl != null && !originalUrl.isEmpty()) {
-                        LOGGER.warn("[CACHE] Propagating URL to server request: {} ===", originalUrl);
-                    }
-                } catch (Exception e) {
-                    LOGGER.error("[CACHE] Error in onProxyToServerRequest: {} ===", e.getMessage(), e);
-                }
-            }
-
-            @Override
-            public void onServerToProxyResponse(@NotNull ProxyResponse response) {
-                try {
-                    LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse ENTRY - Thread: {} ===", Thread.currentThread().getName());
-                    String fullUrl = getFullUrl(currentRequest);
-                    LOGGER.warn("[CACHE] [3/4] URL from stored request: {} ===", fullUrl);
-                    LOGGER.warn("[CACHE] [3/4] Response code: {} ===", response.code());
-                    LOGGER.warn("[CACHE] [3/4] All response headers: {} ===", response.headers());
-
-                    // Store headers for this response
-                    Map<String, String> headers = new HashMap<>();
-                    for (String name : response.headers().names()) {
-                        headers.put(name, response.headers().get(name));
-                    }
-                    responseHeaders.put(fullUrl, headers);
-
-                    // Initialize chunk buffer if needed
-                    if (!chunkBuffers.containsKey(fullUrl)) {
-                        chunkBuffers.put(fullUrl, new ByteArrayOutputStream());
-                    }
-
-                    // If we have content, add it to the buffer
-                    if (response.isDataPacket()) {
-                        byte[] content = response.content();
-                        if (content != null && content.length > 0) {
-                            LOGGER.warn("[CACHE] [3/4] Adding {} bytes to chunk buffer for {} ===", content.length, fullUrl);
-                            chunkBuffers.get(fullUrl).write(content);
+                        if (!isCacheable(request)) {
+                            LOGGER.info("[CACHE] Not cacheable: {} ===", fullUrl);
+                            return;
                         }
-                    }
 
-                    LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse EXIT ===");
-                } catch (Exception e) {
-                    LOGGER.error("[CACHE] Error in onServerToProxyResponse: {} ===", e.getMessage(), e);
-                }
-            }
-
-            @Override
-            public void onProxyToClientResponse(@NotNull ProxyResponse response) {
-                try {
-                    String fullUrl = getFullUrl(currentRequest);
-                    if (!isCacheable(currentRequest)) {
-                        LOGGER.warn("[CACHE] Request not cacheable: {} ===", fullUrl);
-                        cleanup(fullUrl);
-                        return;
-                    }
-
-                    // Get the buffered content
-                    ByteArrayOutputStream buffer = chunkBuffers.get(fullUrl);
-                    Map<String, String> headers = responseHeaders.get(fullUrl);
-                    
-                    if (buffer == null || headers == null) {
-                        LOGGER.warn("[CACHE] No buffered content or headers for {} ===", fullUrl);
-                        cleanup(fullUrl);
-                        return;
-                    }
-
-                    // Add any final content
-                    if (response.isDataPacket()) {
-                        byte[] content = response.content();
-                        if (content != null && content.length > 0) {
-                            LOGGER.warn("[CACHE] Adding final {} bytes to chunk buffer for {} ===", content.length, fullUrl);
-                            buffer.write(content);
+                        // Try to load from cache
+                        String cacheKey = generateCacheKey(fullUrl);
+                        CacheEntry entry = loadFromDisk(cacheKey);
+                        if (entry == null) {
+                            LOGGER.info("[CACHE] Cache miss: {} ===", fullUrl);
+                            return;
                         }
+
+                        // Build response from cache
+                        ProxyResponse response = server.getResponseBuilder(new String(entry.content, StandardCharsets.UTF_8))
+                            .code(200)
+                            .header("Content-Length", String.valueOf(entry.content.length))
+                            .header("X-Cache", "HIT")
+                            .build();
+
+                        // Add optional headers
+                        if (entry.contentType != null) {
+                            response.headers().set("Content-Type", entry.contentType);
+                        }
+                        if (entry.contentEncoding != null) {
+                            response.headers().set("Content-Encoding", entry.contentEncoding);
+                        }
+                        if (entry.etag != null) {
+                            response.headers().set("ETag", entry.etag);
+                        }
+
+                        request.setResponse(response);
+                        LOGGER.warn("[CACHE] Served from cache: {} ({} bytes) ===", fullUrl, entry.content.length);
+                    } catch (Exception e) {
+                        LOGGER.error("[CACHE] Error in onClientToProxyRequest: {} ===", e.getMessage(), e);
                     }
+                }
 
-                    byte[] finalContent = buffer.toByteArray();
-                    if (finalContent.length == 0) {
-                        LOGGER.error("[CACHE] Empty response body after buffering ===");
-                        cleanup(fullUrl);
-                        return;
+                @Override
+                public void onServerToProxyResponse(@NotNull ProxyResponse response) {
+                    try {
+                        String fullUrl = getFullUrl(currentRequest);
+                        LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse for {} ===", fullUrl);
+
+                        // Store headers for this response
+                        Map<String, String> headers = new HashMap<>();
+                        for (String name : response.headers().names()) {
+                            headers.put(name, response.headers().get(name));
+                        }
+                        responseHeaders.put(fullUrl, headers);
+
+                        // Initialize chunk buffer if needed
+                        if (!chunkBuffers.containsKey(fullUrl)) {
+                            chunkBuffers.put(fullUrl, new ByteArrayOutputStream());
+                        }
+
+                        // Get content if available
+                        try {
+                            if (response.isDataPacket()) {
+                                byte[] content = response.content();
+                                LOGGER.warn("[CACHE] [3/4] Content is null: {}, Content class: {} ===", (content == null), (content != null ? content.getClass().getName() : "null"));
+                                if (content != null && content.length > 0) {
+                                    LOGGER.warn("[CACHE] [3/4] Writing {} bytes to buffer ===", content.length);
+                                    chunkBuffers.get(fullUrl).write(content);
+                                } else {
+                                    LOGGER.warn("[CACHE] [3/4] Data packet has no content ===");
+                                    // Try to extract content using reflection by examining all fields
+                                    try {
+                                        Class<?> responseClass = response.getClass();
+                                        java.lang.reflect.Field[] fields = responseClass.getDeclaredFields();
+                                        LOGGER.warn("[CACHE] [3/4] Examining {} fields in {} ===", fields.length, responseClass.getName());
+                                        
+                                        // Try all fields that might contain the HTTP content
+                                        for (java.lang.reflect.Field field : fields) {
+                                            field.setAccessible(true);
+                                            String fieldName = field.getName();
+                                            LOGGER.warn("[CACHE] [3/4] Checking field: {} of type {} ===", fieldName, field.getType().getName());
+                                            
+                                            try {
+                                                Object fieldValue = field.get(response);
+                                                if (fieldValue != null) {
+                                                    // If field is an HttpContent or contains a ByteBuf
+                                                    if (fieldValue instanceof io.netty.handler.codec.http.HttpContent) {
+                                                        io.netty.handler.codec.http.HttpContent httpContent = (io.netty.handler.codec.http.HttpContent) fieldValue;
+                                                        io.netty.buffer.ByteBuf buf = httpContent.content();
+                                                        if (buf != null && buf.readableBytes() > 0) {
+                                                            byte[] bytes = new byte[buf.readableBytes()];
+                                                            buf.getBytes(buf.readerIndex(), bytes);
+                                                            LOGGER.warn("[CACHE] [3/4] Got {} bytes from field {} ===", bytes.length, fieldName);
+                                                            chunkBuffers.get(fullUrl).write(bytes);
+                                                            break;
+                                                        }
+                                                    } else if (fieldValue instanceof io.netty.buffer.ByteBuf) {
+                                                        io.netty.buffer.ByteBuf buf = (io.netty.buffer.ByteBuf) fieldValue;
+                                                        if (buf.readableBytes() > 0) {
+                                                            byte[] bytes = new byte[buf.readableBytes()];
+                                                            buf.getBytes(buf.readerIndex(), bytes);
+                                                            LOGGER.warn("[CACHE] [3/4] Got {} bytes from ByteBuf field {} ===", bytes.length, fieldName);
+                                                            chunkBuffers.get(fullUrl).write(bytes);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            } catch (Exception e) {
+                                                LOGGER.warn("[CACHE] [3/4] Error accessing field {}: {} ===", fieldName, e.getMessage());
+                                            }
+                                        }
+                                    } catch (Exception e) {
+                                        LOGGER.error("[CACHE] [3/4] Error getting content via reflection: {} ===", e.getMessage());
+                                    }
+                                }
+                            } else {
+                                // This might be a chunked response
+                                String transferEncoding = response.headers().get("Transfer-Encoding");
+                                if ("chunked".equalsIgnoreCase(transferEncoding)) {
+                                    LOGGER.warn("[CACHE] [3/4] Chunked response detected ===");
+                                    // We'll collect chunks in onProxyToClientResponse
+                                } else {
+                                    LOGGER.warn("[CACHE] [3/4] Not a data packet or chunked response ===");
+                                }
+                            }
+                        } catch (IllegalStateException e) {
+                            LOGGER.warn("[CACHE] [3/4] Cannot get content: {} ===", e.getMessage());
+                        }
+
+                        LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse EXIT ===");
+                    } catch (Exception e) {
+                        LOGGER.error("[CACHE] Error in onServerToProxyResponse: {} ===", e.getMessage(), e);
+                        cleanup(getFullUrl(currentRequest));
                     }
+                }
 
-                    // Get required headers from stored headers
-                    String contentType = headers.get("Content-Type");
-                    String contentEncoding = headers.get("Content-Encoding");
-                    String etag = headers.get("ETag");
+                @Override
+                public void onProxyToClientResponse(@NotNull ProxyResponse response) {
+                    try {
+                        String fullUrl = getFullUrl(currentRequest);
+                        LOGGER.warn("[CACHE] [4/4] onProxyToClientResponse for {} ===", fullUrl);
 
-                    if (contentType == null) {
-                        LOGGER.warn("[CACHE] Missing required headers ===");
-                        cleanup(fullUrl);
-                        return;
-                    }
+                        ByteArrayOutputStream buffer = chunkBuffers.get(fullUrl);
+                        Map<String, String> headers = responseHeaders.get(fullUrl);
 
-                    // Create cache entry
-                    CacheEntry entry = new CacheEntry(finalContent, contentType, contentEncoding, etag);
+                        if (buffer == null || headers == null) {
+                            LOGGER.warn("[CACHE] No buffered content or headers for {} ===", fullUrl);
+                            cleanup(fullUrl);
+                            return;
+                        }
+                        
+                        // If our buffer is empty, try to get content from the response
+                        if (buffer.size() == 0 && response.isDataPacket()) {
+                            try {
+                                byte[] content = response.content();
+                                if (content != null && content.length > 0) {
+                                    LOGGER.warn("[CACHE] [4/4] Got {} bytes from response in final stage ===", content.length);
+                                    buffer.write(content);
+                                } else {
+                                    // Try to extract content using reflection by examining all fields
+                                    try {
+                                        Class<?> responseClass = response.getClass();
+                                        java.lang.reflect.Field[] fields = responseClass.getDeclaredFields();
+                                        LOGGER.warn("[CACHE] [4/4] Examining {} fields in {} ===", fields.length, responseClass.getName());
+                                        
+                                        // Try all fields that might contain the HTTP content
+                                        for (java.lang.reflect.Field field : fields) {
+                                            field.setAccessible(true);
+                                            String fieldName = field.getName();
+                                            LOGGER.warn("[CACHE] [4/4] Checking field: {} of type {} ===", fieldName, field.getType().getName());
+                                            
+                                            try {
+                                                Object fieldValue = field.get(response);
+                                                if (fieldValue != null) {
+                                                    // If field is an HttpContent or contains a ByteBuf
+                                                    if (fieldValue instanceof io.netty.handler.codec.http.HttpContent) {
+                                                        io.netty.handler.codec.http.HttpContent httpContent = (io.netty.handler.codec.http.HttpContent) fieldValue;
+                                                        io.netty.buffer.ByteBuf buf = httpContent.content();
+                                                        if (buf != null && buf.readableBytes() > 0) {
+                                                            byte[] bytes = new byte[buf.readableBytes()];
+                                                            buf.getBytes(buf.readerIndex(), bytes);
+                                                            LOGGER.warn("[CACHE] [4/4] Got {} bytes from field {} ===", bytes.length, fieldName);
+                                                            buffer.write(bytes);
+                                                            break;
+                                                        }
+                                                    } else if (fieldValue instanceof io.netty.buffer.ByteBuf) {
+                                                        io.netty.buffer.ByteBuf buf = (io.netty.buffer.ByteBuf) fieldValue;
+                                                        if (buf.readableBytes() > 0) {
+                                                            byte[] bytes = new byte[buf.readableBytes()];
+                                                            buf.getBytes(buf.readerIndex(), bytes);
+                                                            LOGGER.warn("[CACHE] [4/4] Got {} bytes from ByteBuf field {} ===", bytes.length, fieldName);
+                                                            buffer.write(bytes);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            } catch (Exception e) {
+                                                LOGGER.warn("[CACHE] [4/4] Error accessing field {}: {} ===", fieldName, e.getMessage());
+                                            }
+                                        }
+                                    } catch (Exception e) {
+                                        LOGGER.warn("[CACHE] [4/4] Could not access httpObject field: {} ===", e.getMessage());
+                                    }
+                                }
+                            } catch (Exception e) {
+                                LOGGER.error("[CACHE] [4/4] Error getting content in final stage: {} ===", e.getMessage());
+                            }
+                        }
 
-                    // Save to disk using full URL as key
-                    String cacheKey = generateCacheKey(fullUrl);
-                    saveToDisk(cacheKey, entry);
+                        byte[] finalContent = buffer.toByteArray();
+                        LOGGER.warn("[CACHE] Final content size: {} bytes ===", finalContent.length);
 
-                    LOGGER.warn("[CACHE] Response cached: {} ({} bytes, type: {}) ===",
+                        if (finalContent.length == 0) {
+                            LOGGER.error("[CACHE] Empty response body after buffering ===");
+                            cleanup(fullUrl);
+                            return;
+                        }
+
+                        String contentType = headers.get("Content-Type");
+                        String contentEncoding = headers.get("Content-Encoding");
+                        String etag = headers.get("ETag");
+
+                        LOGGER.warn("[CACHE] Content-Type: {}, Content-Encoding: {}, ETag: {} ===", 
+                        contentType, contentEncoding, etag);
+
+                        if (contentType == null) {
+                            LOGGER.warn("[CACHE] Missing required headers ===");
+                            cleanup(fullUrl);
+                            return;
+                        }
+
+                        // Create cache entry
+                        CacheEntry entry = new CacheEntry(finalContent, contentType, contentEncoding, etag);
+
+                        // Save to disk using full URL as key
+                        String cacheKey = generateCacheKey(fullUrl);
+                        saveToDisk(cacheKey, entry);
+
+                        LOGGER.warn("[CACHE] Response cached successfully: {} ({} bytes, type: {}) ===",
                         fullUrl, finalContent.length, contentType);
 
-                    // Clean up
-                    cleanup(fullUrl);
-                } catch (Exception e) {
-                    LOGGER.error("[CACHE] Error in onProxyToClientResponse: {} ===", e.getMessage(), e);
-                    cleanup(getFullUrl(currentRequest));
-                }
-            }
-
-            private boolean isCacheable(ProxyRequest request) {
-                String method = request.getMethod().toString();
-                String url = getFullUrl(request);
-                
-                // Allow caching for CONNECT requests to known static content hosts
-                if ("CONNECT".equalsIgnoreCase(method)) {
-                    String host = request.headers().get("Host");
-                    if (host != null && (host.equals("example.com:443") || host.startsWith("10.0.2.2:"))) {
-                        LOGGER.warn("[CACHE] Allowing cache for trusted HTTPS host: {}", url);
-                        return true;
-                    }
-                    LOGGER.warn("[CACHE] Not cacheable - CONNECT request for {}", url);
-                    return false;
-                }
-
-                // Only cache GET requests
-                if (!"GET".equalsIgnoreCase(method)) {
-                    LOGGER.info("[CACHE] Not cacheable - non-GET request: {} ===", method);
-                    return false;
-                }
-
-                // Check if this is a Jellyfin media request
-                if (url.contains("/items/")) {
-                    // Check for theme media or direct video content
-                    if (url.contains("/thememedia") || url.contains("/download")) {
-                        LOGGER.warn("[CACHE] Cacheable - Jellyfin video content: {} ===", url);
-                        LOGGER.warn("[CACHE] Content-Type: {} ===", request.headers().get("Content-Type"));
-                        LOGGER.warn("[CACHE] Range: {} ===", request.headers().get("Range"));
-                        return true;
-                    }
-                    
-                    // Check for video segments and manifests
-                    if (url.contains("/videos/") || url.contains("/audio/") || 
-                        url.contains("/videostream") || url.contains("/playbackinfo") || 
-                        url.contains("/stream") || url.contains("/universal") || 
-                        url.contains("/master.m3u8") || url.contains("/manifest") || 
-                        url.contains("/segments/") || url.contains(".ts") || 
-                        url.contains(".m4s") || url.contains(".mpd")) {
-                        LOGGER.info("[CACHE] Cacheable - Jellyfin media segment: {} ===", url);
-                        return true;
+                        // Clean up
+                        cleanup(fullUrl);
+                    } catch (Exception e) {
+                        LOGGER.error("[CACHE] Error in onProxyToClientResponse: {} ===", e.getMessage(), e);
+                        cleanup(getFullUrl(currentRequest));
                     }
                 }
-
-                // Check file extension
-                try {
-                    int dotIndex = url.lastIndexOf('.');
-                    if (dotIndex == -1) return false;
-                    String extension = url.substring(dotIndex + 1).toLowerCase();
-                    return CACHEABLE_EXTENSIONS.contains(extension);
-                } catch (Exception e) {
-                    LOGGER.error("[CACHE] Error checking cacheability: {} ===", e.getMessage());
-                    return false;
-                }
-            }
-        });
+            });
+        } catch (Exception e) {
+            LOGGER.error("[CACHE] Error in onProxyInitialization: {} ===", e.getMessage(), e);
+        }
     }
 }
