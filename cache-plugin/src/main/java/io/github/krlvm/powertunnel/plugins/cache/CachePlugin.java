@@ -5,6 +5,7 @@ import io.github.krlvm.powertunnel.sdk.http.ProxyResponse;
 import io.github.krlvm.powertunnel.sdk.proxy.ProxyAdapter;
 import io.github.krlvm.powertunnel.sdk.proxy.ProxyServer;
 import io.github.krlvm.powertunnel.sdk.plugin.PowerTunnelPlugin;
+import io.github.krlvm.powertunnel.sdk.types.FullAddress;
 
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
@@ -26,6 +27,7 @@ public class CachePlugin extends PowerTunnelPlugin {
     // Chunk buffering
     private final Map<String, ByteArrayOutputStream> chunkBuffers = new HashMap<>();
     private final Map<String, Map<String, String>> responseHeaders = new HashMap<>();
+    private final Map<String, ByteArrayOutputStream> chunkData = new HashMap<>();
 
     private static final Set<String> CACHEABLE_EXTENSIONS = new HashSet<>(Arrays.asList(
         "jpg", "jpeg", "png", "gif", "webp", "ico", "bmp",  // Images
@@ -238,21 +240,37 @@ public class CachePlugin extends PowerTunnelPlugin {
     }
 
     private void cleanup(String fullUrl) {
-        if (fullUrl != null) {
-            chunkBuffers.remove(fullUrl);
-            responseHeaders.remove(fullUrl);
-        }
+        chunkBuffers.remove(fullUrl);
+        responseHeaders.remove(fullUrl);
+        chunkData.remove(fullUrl);
     }
 
     @Override
-    public void onProxyInitialization(@NotNull ProxyServer server) {
+    public void onProxyInitialization(@NotNull ProxyServer proxy) {
         try {
             // Initialize cache directory
             cacheDir = Paths.get("/data/data/io.github.krlvm.powertunnel.android.dev/cache/powertunnel");
             Files.createDirectories(cacheDir);
             LOGGER.info("[CACHE] Initialized cache directory: {} ===", cacheDir);
+            
+            // Enable full response collection to ensure we get all chunks
+            proxy.setFullResponse(true);
+            LOGGER.info("[CACHE] Enabled full response collection ===");
 
-            this.registerProxyListener(new ProxyAdapter() {
+            registerProxyListener(new ProxyAdapter() {
+                // Override to control chunk size
+                @Override
+                public Integer onGetChunkSize(@NotNull FullAddress address) {
+                    // Use default chunk size
+                    return null;
+                }
+                
+                // Override to ensure full chunking for cacheable requests
+                @Override
+                public Boolean isFullChunking(@NotNull FullAddress address) {
+                    // Enable full chunking for all requests
+                    return true;
+                }
                 @Override
                 public void onClientToProxyRequest(@NotNull ProxyRequest request) {
                     try {
@@ -274,7 +292,8 @@ public class CachePlugin extends PowerTunnelPlugin {
                         }
 
                         // Build response from cache
-                        ProxyResponse response = server.getResponseBuilder(new String(entry.content, StandardCharsets.UTF_8))
+                        // Get the proxy server first, then use its response builder
+                        ProxyResponse response = getServer().getProxyServer().getResponseBuilder(new String(entry.content, StandardCharsets.UTF_8))
                             .code(200)
                             .header("Content-Length", String.valueOf(entry.content.length))
                             .header("X-Cache", "HIT")
@@ -310,9 +329,11 @@ public class CachePlugin extends PowerTunnelPlugin {
                             chunkBuffers.put(fullUrl, new ByteArrayOutputStream());
                         }
                         
-                        // Store response headers
+                        // Store response headers (case-insensitive)
                         Map<String, String> headers = new HashMap<>();
                         for (String name : response.headers().names()) {
+                            // Store both original case and lowercase version for lookup
+                            headers.put(name.toLowerCase(), response.headers().get(name));
                             headers.put(name, response.headers().get(name));
                         }
                         responseHeaders.put(fullUrl, headers);
@@ -546,6 +567,13 @@ public class CachePlugin extends PowerTunnelPlugin {
                         }
                         
                         byte[] finalContent = buffer.toByteArray();
+                        
+                        // If we have chunk data for this URL, use it instead
+                        if (chunkData.containsKey(fullUrl) && chunkData.get(fullUrl).size() > 0) {
+                            finalContent = chunkData.get(fullUrl).toByteArray();
+                            LOGGER.warn("[CACHE] Using {} bytes from chunk data instead of buffer ===", finalContent.length);
+                        }
+                        
                         LOGGER.warn("[CACHE] Final content size: {} bytes ===", finalContent.length);
 
                         if (finalContent.length == 0) {
@@ -554,9 +582,15 @@ public class CachePlugin extends PowerTunnelPlugin {
                             return;
                         }
 
-                        String contentType = headers.get("Content-Type");
-                        String contentEncoding = headers.get("Content-Encoding");
-                        String etag = headers.get("ETag");
+                        // Case-insensitive header lookup
+                        String contentType = headers.get("content-type");
+                        String contentEncoding = headers.get("content-encoding");
+                        String etag = headers.get("etag");
+                        
+                        LOGGER.warn("[CACHE] Headers map contains {} entries ===", headers.size());
+                        for (Map.Entry<String, String> entry : headers.entrySet()) {
+                            LOGGER.warn("[CACHE] Header: '{}' = '{}' ===", entry.getKey(), entry.getValue());
+                        }
 
                         LOGGER.warn("[CACHE] Content-Type: {}, Content-Encoding: {}, ETag: {} ===", 
                         contentType, contentEncoding, etag);
