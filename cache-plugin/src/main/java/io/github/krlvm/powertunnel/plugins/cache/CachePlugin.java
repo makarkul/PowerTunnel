@@ -300,89 +300,133 @@ public class CachePlugin extends PowerTunnelPlugin {
 
                 @Override
                 public void onServerToProxyResponse(@NotNull ProxyResponse response) {
+                    if (currentRequest == null) return;
+                    String fullUrl = getFullUrl(currentRequest);
+                    LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse for {} ===", fullUrl);
+                    
                     try {
-                        String fullUrl = getFullUrl(currentRequest);
-                        LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse for {} ===", fullUrl);
-
-                        // Store headers for this response
+                        // Initialize buffer if needed
+                        if (!chunkBuffers.containsKey(fullUrl)) {
+                            chunkBuffers.put(fullUrl, new ByteArrayOutputStream());
+                        }
+                        
+                        // Store response headers
                         Map<String, String> headers = new HashMap<>();
                         for (String name : response.headers().names()) {
                             headers.put(name, response.headers().get(name));
                         }
                         responseHeaders.put(fullUrl, headers);
-
-                        // Initialize chunk buffer if needed
-                        if (!chunkBuffers.containsKey(fullUrl)) {
-                            chunkBuffers.put(fullUrl, new ByteArrayOutputStream());
-                        }
-
-                        // Get content if available
+                        
+                        // Try to extract content regardless of isDataPacket result
                         try {
-                            if (response.isDataPacket()) {
+                            // First try: standard content extraction
+                            try {
                                 byte[] content = response.content();
-                                LOGGER.warn("[CACHE] [3/4] Content is null: {}, Content class: {} ===", (content == null), (content != null ? content.getClass().getName() : "null"));
                                 if (content != null && content.length > 0) {
-                                    LOGGER.warn("[CACHE] [3/4] Writing {} bytes to buffer ===", content.length);
+                                    LOGGER.warn("[CACHE] [3/4] Got {} bytes from standard content() ===", content.length);
                                     chunkBuffers.get(fullUrl).write(content);
+                                    LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse EXIT ===");
+                                    return;
                                 } else {
-                                    LOGGER.warn("[CACHE] [3/4] Data packet has no content ===");
-                                    // Try to extract content using reflection by examining all fields
+                                    LOGGER.warn("[CACHE] [3/4] Standard content extraction returned empty or null ===");
+                                }
+                            } catch (Exception e) {
+                                LOGGER.warn("[CACHE] [3/4] Error getting content via standard method: {} ===", e.getMessage());
+                            }
+                            
+                            // Second try: reflection to access httpObject
+                            try {
+                                java.lang.reflect.Method method = response.getClass().getMethod("getLittleProxyObject");
+                                Object httpObject = method.invoke(response);
+                                LOGGER.warn("[CACHE] [3/4] Got httpObject using getLittleProxyObject: {} ===", 
+                                            httpObject != null ? httpObject.getClass().getName() : "null");
+                                
+                                if (httpObject instanceof io.netty.handler.codec.http.HttpContent) {
+                                    io.netty.handler.codec.http.HttpContent httpContent = (io.netty.handler.codec.http.HttpContent) httpObject;
+                                    io.netty.buffer.ByteBuf buf = httpContent.content();
+                                    if (buf != null && buf.readableBytes() > 0) {
+                                        byte[] bytes = new byte[buf.readableBytes()];
+                                        buf.getBytes(buf.readerIndex(), bytes);
+                                        LOGGER.warn("[CACHE] [3/4] Got {} bytes from HttpContent ===", bytes.length);
+                                        chunkBuffers.get(fullUrl).write(bytes);
+                                        LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse EXIT ===");
+                                        return;
+                                    }
+                                } else if (httpObject instanceof io.netty.handler.codec.http.FullHttpResponse) {
+                                    io.netty.handler.codec.http.FullHttpResponse fullResponse = (io.netty.handler.codec.http.FullHttpResponse) httpObject;
+                                    io.netty.buffer.ByteBuf buf = fullResponse.content();
+                                    if (buf != null && buf.readableBytes() > 0) {
+                                        byte[] bytes = new byte[buf.readableBytes()];
+                                        buf.getBytes(buf.readerIndex(), bytes);
+                                        LOGGER.warn("[CACHE] [3/4] Got {} bytes from FullHttpResponse ===", bytes.length);
+                                        chunkBuffers.get(fullUrl).write(bytes);
+                                        LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse EXIT ===");
+                                        return;
+                                    }
+                                }
+                            } catch (Exception e) {
+                                LOGGER.warn("[CACHE] [3/4] Error using getLittleProxyObject: {} ===", e.getMessage());
+                            }
+                            
+                            // Third try: examine fields directly
+                            try {
+                                Class<?> responseClass = response.getClass();
+                                java.lang.reflect.Field[] fields = responseClass.getDeclaredFields();
+                                LOGGER.warn("[CACHE] [3/4] Examining {} fields in {} ===", fields.length, responseClass.getName());
+                                
+                                // Try all fields that might contain the HTTP content
+                                for (java.lang.reflect.Field field : fields) {
+                                    field.setAccessible(true);
+                                    String fieldName = field.getName();
+                                    LOGGER.warn("[CACHE] [3/4] Checking field: {} of type {} ===", fieldName, field.getType().getName());
+                                    
                                     try {
-                                        Class<?> responseClass = response.getClass();
-                                        java.lang.reflect.Field[] fields = responseClass.getDeclaredFields();
-                                        LOGGER.warn("[CACHE] [3/4] Examining {} fields in {} ===", fields.length, responseClass.getName());
-                                        
-                                        // Try all fields that might contain the HTTP content
-                                        for (java.lang.reflect.Field field : fields) {
-                                            field.setAccessible(true);
-                                            String fieldName = field.getName();
-                                            LOGGER.warn("[CACHE] [3/4] Checking field: {} of type {} ===", fieldName, field.getType().getName());
-                                            
-                                            try {
-                                                Object fieldValue = field.get(response);
-                                                if (fieldValue != null) {
-                                                    // If field is an HttpContent or contains a ByteBuf
-                                                    if (fieldValue instanceof io.netty.handler.codec.http.HttpContent) {
-                                                        io.netty.handler.codec.http.HttpContent httpContent = (io.netty.handler.codec.http.HttpContent) fieldValue;
-                                                        io.netty.buffer.ByteBuf buf = httpContent.content();
-                                                        if (buf != null && buf.readableBytes() > 0) {
-                                                            byte[] bytes = new byte[buf.readableBytes()];
-                                                            buf.getBytes(buf.readerIndex(), bytes);
-                                                            LOGGER.warn("[CACHE] [3/4] Got {} bytes from field {} ===", bytes.length, fieldName);
-                                                            chunkBuffers.get(fullUrl).write(bytes);
-                                                            break;
-                                                        }
-                                                    } else if (fieldValue instanceof io.netty.buffer.ByteBuf) {
-                                                        io.netty.buffer.ByteBuf buf = (io.netty.buffer.ByteBuf) fieldValue;
-                                                        if (buf.readableBytes() > 0) {
-                                                            byte[] bytes = new byte[buf.readableBytes()];
-                                                            buf.getBytes(buf.readerIndex(), bytes);
-                                                            LOGGER.warn("[CACHE] [3/4] Got {} bytes from ByteBuf field {} ===", bytes.length, fieldName);
-                                                            chunkBuffers.get(fullUrl).write(bytes);
-                                                            break;
-                                                        }
-                                                    }
+                                        Object fieldValue = field.get(response);
+                                        if (fieldValue != null) {
+                                            // If field is an HttpContent or contains a ByteBuf
+                                            if (fieldValue instanceof io.netty.handler.codec.http.HttpContent) {
+                                                io.netty.handler.codec.http.HttpContent httpContent = (io.netty.handler.codec.http.HttpContent) fieldValue;
+                                                io.netty.buffer.ByteBuf buf = httpContent.content();
+                                                if (buf != null && buf.readableBytes() > 0) {
+                                                    byte[] bytes = new byte[buf.readableBytes()];
+                                                    buf.getBytes(buf.readerIndex(), bytes);
+                                                    LOGGER.warn("[CACHE] [3/4] Got {} bytes from field {} ===", bytes.length, fieldName);
+                                                    chunkBuffers.get(fullUrl).write(bytes);
+                                                    LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse EXIT ===");
+                                                    return;
                                                 }
-                                            } catch (Exception e) {
-                                                LOGGER.warn("[CACHE] [3/4] Error accessing field {}: {} ===", fieldName, e.getMessage());
+                                            } else if (fieldValue instanceof io.netty.buffer.ByteBuf) {
+                                                io.netty.buffer.ByteBuf buf = (io.netty.buffer.ByteBuf) fieldValue;
+                                                if (buf.readableBytes() > 0) {
+                                                    byte[] bytes = new byte[buf.readableBytes()];
+                                                    buf.getBytes(buf.readerIndex(), bytes);
+                                                    LOGGER.warn("[CACHE] [3/4] Got {} bytes from ByteBuf field {} ===", bytes.length, fieldName);
+                                                    chunkBuffers.get(fullUrl).write(bytes);
+                                                    LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse EXIT ===");
+                                                    return;
+                                                }
                                             }
                                         }
                                     } catch (Exception e) {
-                                        LOGGER.error("[CACHE] [3/4] Error getting content via reflection: {} ===", e.getMessage());
+                                        LOGGER.warn("[CACHE] [3/4] Error accessing field {}: {} ===", fieldName, e.getMessage());
                                     }
                                 }
-                            } else {
-                                // This might be a chunked response
-                                String transferEncoding = response.headers().get("Transfer-Encoding");
-                                if ("chunked".equalsIgnoreCase(transferEncoding)) {
-                                    LOGGER.warn("[CACHE] [3/4] Chunked response detected ===");
-                                    // We'll collect chunks in onProxyToClientResponse
-                                } else {
-                                    LOGGER.warn("[CACHE] [3/4] Not a data packet or chunked response ===");
-                                }
+                            } catch (Exception e) {
+                                LOGGER.error("[CACHE] [3/4] Error getting content via reflection: {} ===", e.getMessage());
                             }
-                        } catch (IllegalStateException e) {
-                            LOGGER.warn("[CACHE] [3/4] Cannot get content: {} ===", e.getMessage());
+                            
+                            // Check for Transfer-Encoding: chunked header
+                            String transferEncoding = response.headers().get("Transfer-Encoding");
+                            if (transferEncoding != null && transferEncoding.equalsIgnoreCase("chunked")) {
+                                LOGGER.warn("[CACHE] [3/4] Detected chunked encoding, will try to extract in onProxyToClientResponse ===");
+                                // For chunked responses, we'll try again in onProxyToClientResponse
+                                LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse EXIT ===");
+                                return;
+                            }
+                            
+                            LOGGER.warn("[CACHE] [3/4] Failed to extract content, will try again in onProxyToClientResponse ===");
+                        } catch (Exception e) {
+                            LOGGER.error("[CACHE] [3/4] Error extracting content: {} ===", e.getMessage());
                         }
 
                         LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse EXIT ===");
@@ -394,77 +438,113 @@ public class CachePlugin extends PowerTunnelPlugin {
 
                 @Override
                 public void onProxyToClientResponse(@NotNull ProxyResponse response) {
+                    if (currentRequest == null) return;
+                    String fullUrl = getFullUrl(currentRequest);
+                    LOGGER.warn("[CACHE] [4/4] onProxyToClientResponse for {} ===", fullUrl);
+                    
                     try {
-                        String fullUrl = getFullUrl(currentRequest);
-                        LOGGER.warn("[CACHE] [4/4] onProxyToClientResponse for {} ===", fullUrl);
-
-                        ByteArrayOutputStream buffer = chunkBuffers.get(fullUrl);
-                        Map<String, String> headers = responseHeaders.get(fullUrl);
-
-                        if (buffer == null || headers == null) {
-                            LOGGER.warn("[CACHE] No buffered content or headers for {} ===", fullUrl);
-                            cleanup(fullUrl);
+                        // Check if we have buffered content and headers
+                        if (!chunkBuffers.containsKey(fullUrl) || !responseHeaders.containsKey(fullUrl)) {
+                            LOGGER.warn("[CACHE] [4/4] No buffered content or headers for {} ===", fullUrl);
                             return;
                         }
                         
-                        // If our buffer is empty, try to get content from the response
-                        if (buffer.size() == 0 && response.isDataPacket()) {
+                        Map<String, String> headers = responseHeaders.get(fullUrl);
+                        ByteArrayOutputStream buffer = chunkBuffers.get(fullUrl);
+                        
+                        // Try to extract content if buffer is empty
+                        if (buffer.size() == 0) {
                             try {
-                                byte[] content = response.content();
-                                if (content != null && content.length > 0) {
-                                    LOGGER.warn("[CACHE] [4/4] Got {} bytes from response in final stage ===", content.length);
-                                    buffer.write(content);
-                                } else {
-                                    // Try to extract content using reflection by examining all fields
-                                    try {
-                                        Class<?> responseClass = response.getClass();
-                                        java.lang.reflect.Field[] fields = responseClass.getDeclaredFields();
-                                        LOGGER.warn("[CACHE] [4/4] Examining {} fields in {} ===", fields.length, responseClass.getName());
+                                // First try: standard content extraction
+                                try {
+                                    byte[] content = response.content();
+                                    if (content != null && content.length > 0) {
+                                        LOGGER.warn("[CACHE] [4/4] Got {} bytes from standard content() in final stage ===", content.length);
+                                        buffer.write(content);
+                                    } else {
+                                        LOGGER.warn("[CACHE] [4/4] Standard content extraction returned empty or null in final stage ===");
+                                    }
+                                } catch (Exception e) {
+                                    LOGGER.warn("[CACHE] [4/4] Error getting content via standard method in final stage: {} ===", e.getMessage());
+                                }
+                                
+                                // Second try: reflection to access httpObject
+                                try {
+                                    java.lang.reflect.Method method = response.getClass().getMethod("getLittleProxyObject");
+                                    Object httpObject = method.invoke(response);
+                                    LOGGER.warn("[CACHE] [4/4] Got httpObject using getLittleProxyObject: {} ===", 
+                                                httpObject != null ? httpObject.getClass().getName() : "null");
+                                    
+                                    if (httpObject instanceof io.netty.handler.codec.http.HttpContent) {
+                                        io.netty.handler.codec.http.HttpContent httpContent = (io.netty.handler.codec.http.HttpContent) httpObject;
+                                        io.netty.buffer.ByteBuf buf = httpContent.content();
+                                        if (buf != null && buf.readableBytes() > 0) {
+                                            byte[] bytes = new byte[buf.readableBytes()];
+                                            buf.getBytes(buf.readerIndex(), bytes);
+                                            LOGGER.warn("[CACHE] [4/4] Got {} bytes from HttpContent in final stage ===", bytes.length);
+                                            buffer.write(bytes);
+                                        }
+                                    } else if (httpObject instanceof io.netty.handler.codec.http.FullHttpResponse) {
+                                        io.netty.handler.codec.http.FullHttpResponse fullResponse = (io.netty.handler.codec.http.FullHttpResponse) httpObject;
+                                        io.netty.buffer.ByteBuf buf = fullResponse.content();
+                                        if (buf != null && buf.readableBytes() > 0) {
+                                            byte[] bytes = new byte[buf.readableBytes()];
+                                            buf.getBytes(buf.readerIndex(), bytes);
+                                            LOGGER.warn("[CACHE] [4/4] Got {} bytes from FullHttpResponse in final stage ===", bytes.length);
+                                            buffer.write(bytes);
+                                        }
+                                    }
+                                } catch (Exception e) {
+                                    LOGGER.warn("[CACHE] [4/4] Error using getLittleProxyObject in final stage: {} ===", e.getMessage());
+                                }
+                                
+                                // Third try: examine fields directly
+                                try {
+                                    Class<?> responseClass = response.getClass();
+                                    java.lang.reflect.Field[] fields = responseClass.getDeclaredFields();
+                                    LOGGER.warn("[CACHE] [4/4] Examining {} fields in {} ===", fields.length, responseClass.getName());
+                                    
+                                    // Try all fields that might contain the HTTP content
+                                    for (java.lang.reflect.Field field : fields) {
+                                        field.setAccessible(true);
+                                        String fieldName = field.getName();
+                                        LOGGER.warn("[CACHE] [4/4] Checking field: {} of type {} ===", fieldName, field.getType().getName());
                                         
-                                        // Try all fields that might contain the HTTP content
-                                        for (java.lang.reflect.Field field : fields) {
-                                            field.setAccessible(true);
-                                            String fieldName = field.getName();
-                                            LOGGER.warn("[CACHE] [4/4] Checking field: {} of type {} ===", fieldName, field.getType().getName());
-                                            
-                                            try {
-                                                Object fieldValue = field.get(response);
-                                                if (fieldValue != null) {
-                                                    // If field is an HttpContent or contains a ByteBuf
-                                                    if (fieldValue instanceof io.netty.handler.codec.http.HttpContent) {
-                                                        io.netty.handler.codec.http.HttpContent httpContent = (io.netty.handler.codec.http.HttpContent) fieldValue;
-                                                        io.netty.buffer.ByteBuf buf = httpContent.content();
-                                                        if (buf != null && buf.readableBytes() > 0) {
-                                                            byte[] bytes = new byte[buf.readableBytes()];
-                                                            buf.getBytes(buf.readerIndex(), bytes);
-                                                            LOGGER.warn("[CACHE] [4/4] Got {} bytes from field {} ===", bytes.length, fieldName);
-                                                            buffer.write(bytes);
-                                                            break;
-                                                        }
-                                                    } else if (fieldValue instanceof io.netty.buffer.ByteBuf) {
-                                                        io.netty.buffer.ByteBuf buf = (io.netty.buffer.ByteBuf) fieldValue;
-                                                        if (buf.readableBytes() > 0) {
-                                                            byte[] bytes = new byte[buf.readableBytes()];
-                                                            buf.getBytes(buf.readerIndex(), bytes);
-                                                            LOGGER.warn("[CACHE] [4/4] Got {} bytes from ByteBuf field {} ===", bytes.length, fieldName);
-                                                            buffer.write(bytes);
-                                                            break;
-                                                        }
+                                        try {
+                                            Object fieldValue = field.get(response);
+                                            if (fieldValue != null) {
+                                                // If field is an HttpContent or contains a ByteBuf
+                                                if (fieldValue instanceof io.netty.handler.codec.http.HttpContent) {
+                                                    io.netty.handler.codec.http.HttpContent httpContent = (io.netty.handler.codec.http.HttpContent) fieldValue;
+                                                    io.netty.buffer.ByteBuf buf = httpContent.content();
+                                                    if (buf != null && buf.readableBytes() > 0) {
+                                                        byte[] bytes = new byte[buf.readableBytes()];
+                                                        buf.getBytes(buf.readerIndex(), bytes);
+                                                        LOGGER.warn("[CACHE] [4/4] Got {} bytes from field {} ===", bytes.length, fieldName);
+                                                        buffer.write(bytes);
+                                                    }
+                                                } else if (fieldValue instanceof io.netty.buffer.ByteBuf) {
+                                                    io.netty.buffer.ByteBuf buf = (io.netty.buffer.ByteBuf) fieldValue;
+                                                    if (buf.readableBytes() > 0) {
+                                                        byte[] bytes = new byte[buf.readableBytes()];
+                                                        buf.getBytes(buf.readerIndex(), bytes);
+                                                        LOGGER.warn("[CACHE] [4/4] Got {} bytes from ByteBuf field {} ===", bytes.length, fieldName);
+                                                        buffer.write(bytes);
                                                     }
                                                 }
-                                            } catch (Exception e) {
-                                                LOGGER.warn("[CACHE] [4/4] Error accessing field {}: {} ===", fieldName, e.getMessage());
                                             }
+                                        } catch (Exception e) {
+                                            LOGGER.warn("[CACHE] [4/4] Error accessing field {}: {} ===", fieldName, e.getMessage());
                                         }
-                                    } catch (Exception e) {
-                                        LOGGER.warn("[CACHE] [4/4] Could not access httpObject field: {} ===", e.getMessage());
                                     }
+                                } catch (Exception e) {
+                                    LOGGER.error("[CACHE] [4/4] Error getting content via reflection in final stage: {} ===", e.getMessage());
                                 }
                             } catch (Exception e) {
                                 LOGGER.error("[CACHE] [4/4] Error getting content in final stage: {} ===", e.getMessage());
                             }
                         }
-
+                        
                         byte[] finalContent = buffer.toByteArray();
                         LOGGER.warn("[CACHE] Final content size: {} bytes ===", finalContent.length);
 

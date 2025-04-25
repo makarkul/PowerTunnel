@@ -28,6 +28,7 @@ configurations {
     }
 }
 task fatJar(type: Jar, group: 'build', description: 'Assembles a jar archive containing the main classes and all dependencies.') {
+    dependsOn ":sdk:jar", ":littleproxy:jar"
     archiveClassifier = 'all'
     duplicatesStrategy DuplicatesStrategy.EXCLUDE
 
