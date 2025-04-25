@@ -18,6 +18,9 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.Base64;
+import java.util.HashMap;
+import java.util.Map;
+import java.net.URL;
 
 public class CachePlugin extends PowerTunnelPlugin {
     // Per-connection request tracking
@@ -30,11 +33,10 @@ public class CachePlugin extends PowerTunnelPlugin {
     private final Map<String, ByteArrayOutputStream> chunkData = new HashMap<>();
 
     private static final Set<String> CACHEABLE_EXTENSIONS = new HashSet<>(Arrays.asList(
-        "jpg", "jpeg", "png", "gif", "webp", "ico", "bmp",  // Images
+        // Only cache media files, not web assets
         "mp4", "webm", "m4v", "mkv", "avi", "mov",  // Videos
-        "mp3", "m4a", "ogg", "wav", "flac",                           // Audio
-        "js", "css", "woff", "woff2", "ttf", "eot",           // Web assets
-        "bin", "dat", "iso"                                      // Binary files
+        "mp3", "m4a", "ogg", "wav", "flac",         // Audio
+        "bin", "dat", "iso"                          // Binary files
     ));
 
 
@@ -60,9 +62,40 @@ public class CachePlugin extends PowerTunnelPlugin {
             LOGGER.info("[CACHE] Not cacheable - non-GET request: {} ===", method);
             return false;
         }
+        
+        // Exclude authentication, session, and user-specific API endpoints
+        String lowerUrl = url.toLowerCase();
+        if (lowerUrl.contains("/auth") || 
+            lowerUrl.contains("/login") || 
+            lowerUrl.contains("/sessions") || 
+            lowerUrl.contains("/users/") || 
+            lowerUrl.contains("/token") || 
+            lowerUrl.contains("/api_key") || 
+            lowerUrl.contains("/system/info") || 
+            lowerUrl.contains("/config") ||
+            lowerUrl.contains("/strings/") ||
+            lowerUrl.contains("/translations/") ||
+            lowerUrl.contains("/localization/") ||
+            lowerUrl.contains("/branding/") ||
+            lowerUrl.contains("/web/") ||
+            lowerUrl.contains("/bundle.js") ||
+            lowerUrl.contains("/main.js") ||
+            lowerUrl.contains("/chunk") ||
+            lowerUrl.contains("/resources")) {
+            LOGGER.warn("[CACHE] Not cacheable - Auth/Session/UI/Dynamic request: {} ===", url);
+            return false;
+        }
+        
+        // Explicitly identify Jellyfin image requests (don't cache but allow to pass through)
+        if (url.toLowerCase().contains("/items/") && 
+            (url.toLowerCase().contains("/images/") || 
+             url.toLowerCase().matches(".*?/image[^a-z].*"))) {
+            LOGGER.warn("[CACHE] Not cacheable - Jellyfin image request: {} ===", url);
+            return false;
+        }
 
         // Check if this is a Jellyfin media request
-        if (url.contains("/items/")) {
+        if (url.contains("/items/") || url.contains("/Videos/")) {
             // Check for theme media or direct video content
             if (url.contains("/thememedia") || url.contains("/download")) {
                 LOGGER.warn("[CACHE] Cacheable - Jellyfin video content: {} ===", url);
@@ -77,7 +110,8 @@ public class CachePlugin extends PowerTunnelPlugin {
                 url.contains("/stream") || url.contains("/universal") || 
                 url.contains("/master.m3u8") || url.contains("/manifest") || 
                 url.contains("/segments/") || url.contains(".ts") || 
-                url.contains(".m4s") || url.contains(".mpd")) {
+                url.contains(".m4s") || url.contains(".mpd") ||
+                url.toLowerCase().contains("stream.mp4")) {
                 LOGGER.info("[CACHE] Cacheable - Jellyfin media segment: {} ===", url);
                 return true;
             }
@@ -112,10 +146,71 @@ public class CachePlugin extends PowerTunnelPlugin {
     }
 
     private String generateCacheKey(String url) {
+        // Normalize Jellyfin video stream URLs to ensure consistent cache keys
+        if (url.contains("/Videos/") && url.contains("/stream.mp4")) {
+            try {
+                LOGGER.warn("[CACHE] Normalizing Jellyfin video URL for caching: {} ===", url);
+                
+                // Extract the video ID from the URL path
+                java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("/Videos/([^/]+)/stream");
+                java.util.regex.Matcher matcher = pattern.matcher(url);
+                String videoId = "";
+                if (matcher.find()) {
+                    videoId = matcher.group(1);
+                }
+                
+                // Extract any important static parameters that should be part of the cache key
+                // (like startTimeTicks, playSessionId, etc.)
+                URL originalUrl = new URL(url);
+                String query = originalUrl.getQuery();
+                Map<String, String> staticParams = new HashMap<>();
+                
+                if (query != null && !query.isEmpty()) {
+                    String[] pairs = query.split("&");
+                    for (String pair : pairs) {
+                        String[] keyValue = pair.split("=");
+                        if (keyValue.length == 2) {
+                            String key = keyValue[0].toLowerCase();
+                            // Keep only parameters that affect content but aren't session-specific
+                            if (key.equals("static") || 
+                                key.equals("mediasourceid") || 
+                                key.equals("starttimeticks") || 
+                                key.equals("audiobitrate") || 
+                                key.equals("videobitrate") || 
+                                key.equals("maxwidth") || 
+                                key.equals("maxheight") || 
+                                key.equals("container") || 
+                                key.equals("subtitlemethod")) {
+                                staticParams.put(key, keyValue[1]);
+                            }
+                        }
+                    }
+                }
+                
+                // Create a normalized URL with just the essential parts
+                StringBuilder normalizedUrl = new StringBuilder();
+                normalizedUrl.append(originalUrl.getProtocol()).append("://").append(originalUrl.getHost());
+                if (originalUrl.getPort() != -1) {
+                    normalizedUrl.append(":").append(originalUrl.getPort());
+                }
+                normalizedUrl.append(originalUrl.getPath()).append("?videoId=").append(videoId);
+                
+                // Add any static parameters that affect content
+                for (Map.Entry<String, String> entry : staticParams.entrySet()) {
+                    normalizedUrl.append("&").append(entry.getKey()).append("=").append(entry.getValue());
+                }
+                
+                LOGGER.warn("[CACHE] Normalized URL: {} ===", normalizedUrl.toString());
+                return normalizedUrl.toString();
+            } catch (Exception e) {
+                LOGGER.error("[CACHE] Error normalizing Jellyfin URL: {}", e.getMessage());
+            }
+        }    
+        
+        // Normalize URL by removing trailing slashes and fragments
+        url = url.replaceAll("/+$", "").replaceAll("#.*$", "");
+        
         try {
-            // Normalize URL by removing trailing slashes and fragments
-            url = url.replaceAll("/+$", "").replaceAll("#.*$", "");
-            
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] urlBytes = url.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             byte[] hash = digest.digest(urlBytes);
@@ -323,6 +418,12 @@ public class CachePlugin extends PowerTunnelPlugin {
                     String fullUrl = getFullUrl(currentRequest);
                     LOGGER.warn("[CACHE] [3/4] onServerToProxyResponse for {} ===", fullUrl);
                     
+                    // Skip processing for non-cacheable requests
+                    if (!isCacheable(currentRequest)) {
+                        LOGGER.warn("[CACHE] Skipping non-cacheable request in onServerToProxyResponse: {} ===", fullUrl);
+                        return;
+                    }
+                    
                     try {
                         // Initialize buffer if needed
                         if (!chunkBuffers.containsKey(fullUrl)) {
@@ -462,6 +563,12 @@ public class CachePlugin extends PowerTunnelPlugin {
                     if (currentRequest == null) return;
                     String fullUrl = getFullUrl(currentRequest);
                     LOGGER.warn("[CACHE] [4/4] onProxyToClientResponse for {} ===", fullUrl);
+                    
+                    // Skip processing for non-cacheable requests
+                    if (!isCacheable(currentRequest)) {
+                        LOGGER.warn("[CACHE] Skipping non-cacheable request in onProxyToClientResponse: {} ===", fullUrl);
+                        return;
+                    }
                     
                     try {
                         // Check if we have buffered content and headers
