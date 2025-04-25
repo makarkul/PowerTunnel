@@ -249,6 +249,8 @@ import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseDecoder;
 import io.netty.handler.codec.http.HttpResponseEncoder;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
@@ -332,6 +334,7 @@ import static org.littleshoot.proxy.impl.ConnectionState.HANDSHAKING;
 @Sharable
 public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
     // Pipeline handler names:
+    private static final Logger LOGGER = LoggerFactory.getLogger(ProxyToServerConnection.class);
     private static final String HTTP_ENCODER_NAME = "encoder";
     private static final String HTTP_DECODER_NAME = "decoder";
     private static final String HTTP_PROXY_ENCODER_NAME = "proxy-protocol-encoder";
@@ -427,13 +430,15 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
                 return null;
             }
         }
-        return new ProxyToServerConnection(proxyServer,
+        ProxyToServerConnection conn = new ProxyToServerConnection(proxyServer,
                 clientConnection,
                 serverHostAndPort,
                 chainedProxies.poll(),
                 chainedProxies,
                 initialFilters,
                 globalTrafficShapingHandler);
+        LOGGER.warn("=== [CHUNK] Created new ProxyToServerConnection {} for server {} with client {} ===", conn, serverHostAndPort, clientConnection);
+        return conn;
     }
 
     private ProxyToServerConnection(
@@ -1549,12 +1554,29 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
 
     private boolean _powerTunnelIsChunked = false;
 
+    private void setPowerTunnelIsChunked(boolean value) {
+        LOGGER.warn("=== [CHUNK] Setting _powerTunnelIsChunked={} for connection {} at: ===", value, this);
+        LOGGER.warn("=== [CHUNK] Stack trace: ", new Exception("Stack trace"));
+        _powerTunnelIsChunked = value;
+    }
+
     @Override
     protected void writeRaw(ByteBuf buf) {
+        if (buf.readableBytes() == 0) {
+            // This is likely the start of a new request, reset chunking state
+            LOGGER.warn("=== [CHUNK] Resetting _powerTunnelIsChunked for connection {} ===", this);
+            setPowerTunnelIsChunked(false);
+            return;
+        }
+
         if(!_powerTunnelIsChunked) {
             final int chunkSize = currentFilters.chunkSize();
+            LOGGER.warn("=== [CHUNK] Got chunk size: {} for connection {} with buf size {} ===", chunkSize, this, buf.readableBytes());
             if(chunkSize > 0) {
-                _powerTunnelIsChunked = true;
+                LOGGER.warn("=== [CHUNK] Stack trace for non-zero chunk size: ", new Exception("Stack trace"));
+                LOGGER.warn("=== [CHUNK] Current filters: {} ===", currentFilters.getClass().getName());
+                LOGGER.warn("=== [CHUNK] Setting _powerTunnelIsChunked=true for connection {} ===", this);
+                setPowerTunnelIsChunked(true);
 
                 final byte[] bytes = new byte[buf.readableBytes()];
                 buf.readBytes(bytes);

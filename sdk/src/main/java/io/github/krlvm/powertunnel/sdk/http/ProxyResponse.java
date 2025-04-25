@@ -26,6 +26,14 @@ public interface ProxyResponse extends ProxyMessage {
 
     boolean isDataPacket();
 
+    /**
+     * Get the raw content of the response.
+     * Only available if isDataPacket() returns true.
+     * @return The raw content as a byte array
+     * @throws IllegalStateException if called on a non-data packet
+     */
+    byte[] content();
+
     void setContent(byte[] content);
 
     interface Builder {

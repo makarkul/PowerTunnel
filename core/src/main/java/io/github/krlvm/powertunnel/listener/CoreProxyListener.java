@@ -66,7 +66,15 @@ public class CoreProxyListener implements ProxyListener {
 
     @Override
     public Integer onGetChunkSize(final @NotNull FullAddress address) {
-        final Object result = callProxyListeners(listener -> listener.onGetChunkSize(address));
+        LOGGER.warn("=== [CHUNK] Getting chunk size for address: {} ===", address);
+        final Object result = callProxyListeners(listener -> {
+            Object chunkSize = listener.onGetChunkSize(address);
+            LOGGER.warn("=== [CHUNK] Plugin {} returned chunk size: {} ===", 
+                listener.getClass().getName(), 
+                chunkSize);
+            return chunkSize;
+        });
+        LOGGER.warn("=== [CHUNK] Final chunk size: {} ===", result);
         return result != null ? ((int) result) : 0;
     }
 

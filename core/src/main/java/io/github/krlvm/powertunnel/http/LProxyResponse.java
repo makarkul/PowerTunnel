@@ -24,6 +24,9 @@ import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.http.*;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.nio.charset.StandardCharsets;
 
 public class LProxyResponse extends LProxyMessage<HttpResponse> implements ProxyResponse {
@@ -42,17 +45,51 @@ public class LProxyResponse extends LProxyMessage<HttpResponse> implements Proxy
         httpObject.setStatus(HttpResponseStatus.valueOf(code));
     }
 
+    private static final Logger LOGGER = LoggerFactory.getLogger("PowerTunnelCore");
+
     @Override
     public boolean isDataPacket() {
-        return httpObject instanceof FullHttpResponse;
+        boolean isFullHttp = httpObject instanceof FullHttpResponse;
+        boolean hasContentLength = httpObject.headers().contains(HttpHeaderNames.CONTENT_LENGTH);
+        
+        LOGGER.error("=== [DEBUG] isDataPacket check ===");
+        LOGGER.error("isFullHttp: {}; hasContentLength: {}", isFullHttp, hasContentLength);
+        LOGGER.error("Content-Length header value: {}", httpObject.headers().get(HttpHeaderNames.CONTENT_LENGTH));
+        LOGGER.error("All headers: {}", httpObject.headers());
+        
+        return isFullHttp || hasContentLength;
     }
 
     @Override
     public byte[] content() {
         if(!isDataPacket()) throw new IllegalStateException("Can't get raw content of HttpResponse chunk");
 
-        final ByteBuf buf = ((FullHttpResponse) httpObject).content();
-        return ByteBufUtil.getBytes(buf, 0, buf.readableBytes(), false);
+        if (httpObject instanceof FullHttpResponse) {
+            final ByteBuf buf = ((FullHttpResponse) httpObject).content();
+            return ByteBufUtil.getBytes(buf, 0, buf.readableBytes(), false);
+        } else {
+            // For regular HttpResponse with Content-Length, try to get the content
+            String contentLengthStr = httpObject.headers().get(HttpHeaderNames.CONTENT_LENGTH);
+            if (contentLengthStr != null) {
+                try {
+                    int contentLength = Integer.parseInt(contentLengthStr);
+                    if (contentLength > 0) {
+                        LOGGER.warn("=== [DEBUG] Non-FullHttpResponse with Content-Length: {} ===", contentLength);
+                        if (httpObject instanceof HttpContent) {
+                            ByteBuf buf = ((HttpContent) httpObject).content();
+                            if (buf != null && buf.readableBytes() > 0) {
+                                LOGGER.warn("=== [DEBUG] Found content in HttpContent with {} bytes ===", buf.readableBytes());
+                                return ByteBufUtil.getBytes(buf, 0, buf.readableBytes(), false);
+                            }
+                        }
+                    }
+                } catch (NumberFormatException e) {
+                    LOGGER.error("=== [DEBUG] Invalid Content-Length header: {} ===", contentLengthStr);
+                }
+            }
+            LOGGER.error("=== [DEBUG] No content available in non-FullHttpResponse ===");
+            return new byte[0];
+        }
     }
 
     @Override
