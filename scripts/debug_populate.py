@@ -27,11 +27,11 @@ def populate_jellyfin_video_cache(video_path, item_id, api_key, proxy_url="http:
     # Extract filename for logging
     filename = os.path.basename(video_path)
     
-    # Jellyfin server details - using the actual server port from the URLs
-    jellyfin_host = "localhost:8096"
+    # Jellyfin server details - using the Android emulator address that the player uses
+    jellyfin_host = "10.0.2.2:8096"
     
-    # Create the exact path that matches the Jellyfin URL format
-    target_path = f"/Items/{item_id}/Download?api_key={api_key}"
+    # Create the exact path that matches the Jellyfin URL format used by the player
+    target_path = f"/Videos/{item_id}/stream.mp4?videoId={item_id}&mediasourceid={item_id}&static=true"
     
     file_size = os.path.getsize(video_path)
     print(f"Populating cache with {filename} ({file_size} bytes)")
@@ -152,29 +152,36 @@ def populate_jellyfin_video_cache(video_path, item_id, api_key, proxy_url="http:
             return False
 
 def main():
-    # Check if PowerTunnel admin server is running
+    # Check if admin server is running
     try:
-        response = requests.get("http://localhost:8081/cache/status", timeout=5)
-        print(f"Admin server is running. Status: {response.text}")
+        status = requests.get("http://localhost:8081/cache/status", timeout=5)
+        print(f"Admin server is running. Status: {status.text}")
     except:
-        print("ERROR: PowerTunnel admin server is not running on port 8081")
-        print("Make sure the CachePlugin is loaded and the admin server is started")
-        sys.exit(1)
+        print("Admin server not running or not accessible")
+        return
     
-    # Just use the smaller video file for testing
-    video = {
-        "path": "./Sample (2024)_05s.mp4",  # Using the 5-second sample
-        "item_id": "3b78c1e5f8665308433a2f8c5b8a9da2"
-    }
+    # Sample videos with Jellyfin item IDs
+    videos = [
+        {
+            "path": "./Sample (2024)_05s.mp4",  # 5-second sample
+            "item_id": "3b78c1e5f8665308433a2f8c5b8a9da2",
+            "name": "5-second sample"
+        },
+        {
+            "path": "./Sample (2024)_30s.mp4",  # 30-second sample
+            "item_id": "5a9c8f3e7d1b6c2a4f8e9d7c6b5a3f2e",  # Use the correct ID for the 30s video
+            "name": "30-second sample"
+        }
+    ]
     
     # API key from the URLs
     api_key = "856c2b939fb34c0bb9aef9909840dbaa"
     
-    # Populate cache with the video
-    print(f"\nProcessing {os.path.basename(video['path'])}...")
-    success = populate_jellyfin_video_cache(video['path'], video['item_id'], api_key)
-    
-    print(f"\nCache population {'successful' if success else 'failed'}")
+    # Populate cache with the videos
+    for video in videos:
+        print(f"\nProcessing {video['name']} - {os.path.basename(video['path'])}...")
+        success = populate_jellyfin_video_cache(video['path'], video['item_id'], api_key)
+        print(f"Cache population for {video['name']}: {'successful' if success else 'failed'}")
     
     # Check cache status after population
     try:
@@ -188,10 +195,6 @@ def main():
     # Verify cache by checking the cache files directly using ADB
     print("\nVerifying cache by checking cache files directly...")
     try:
-        # Generate the expected cache key path based on the URL pattern we've seen in logs
-        cache_key = f"http://localhost:8096/Items/{video['item_id']}/Download?api_key={api_key}"
-        print(f"Checking for cache files for URL: {cache_key}")
-        
         # Use subprocess to run ADB commands
         import subprocess
         
@@ -200,7 +203,7 @@ def main():
                "find", "/data/data/io.github.krlvm.powertunnel.android.dev/cache/powertunnel", 
                "-type", "f", "-not", "-name", "*.tmp", "-not", "-name", "*.meta"]
         
-        print("\nRunning command to list cache files:")
+        print("\nRunning command to list all cache files:")
         print(" ".join(cmd))
         
         result = subprocess.run(cmd, capture_output=True, text=True)
