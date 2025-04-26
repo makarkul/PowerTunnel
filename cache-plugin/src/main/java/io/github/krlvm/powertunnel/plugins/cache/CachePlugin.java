@@ -471,11 +471,6 @@ public class CachePlugin extends PowerTunnelPlugin {
         writer.println("HTTP/1.1 " + statusCode + " " + statusMessage);
         writer.println("Content-Type: text/plain");
         writer.println("Content-Length: " + statusMessage.length());
-        writer.println("Connection: close");
-        writer.println();
-        writer.println(statusMessage);
-    }
-    
     private void sendSuccessResponse(Socket clientSocket, String contentType, String content) throws IOException {
         PrintWriter writer = new PrintWriter(clientSocket.getOutputStream(), true);
         writer.println("HTTP/1.1 200 OK");
@@ -551,7 +546,16 @@ public class CachePlugin extends PowerTunnelPlugin {
                 // Handle chunked encoding
                 // First, consume any remaining data in the reader's buffer
                 while (reader.ready()) {
-                    reader.read();
+                    int c = reader.read();
+                    LOGGER.info("[CACHE] [ADMIN] Consumed byte from reader buffer: {} ({})", c, (char)c);
+                }
+                
+                // Debug log available bytes
+                try {
+                    int available = rawInputStream.available();
+                    LOGGER.info("[CACHE] [ADMIN] Raw data available: {} bytes", available);
+                } catch (IOException e) {
+                    LOGGER.error("[CACHE] [ADMIN] Error checking available data: {}", e.getMessage());
                 }
             
                 // Now read the chunked data
@@ -560,20 +564,38 @@ public class CachePlugin extends PowerTunnelPlugin {
                 BufferedReader chunkReader = new BufferedReader(new InputStreamReader(rawInputStream));
                 
                 // Read chunk size line
+                LOGGER.info("[CACHE] [ADMIN] Waiting to read chunk size line...");
                 while ((line = chunkReader.readLine()) != null) {
+                    LOGGER.info("[CACHE] [ADMIN] Read line: '{}' (length: {})", line, line.length());
+                    
+                    // Log raw bytes of the line for debugging
+                    StringBuilder hexLine = new StringBuilder();
+                    for (int i = 0; i < line.length(); i++) {
+                        hexLine.append(String.format("%02X ", (int)line.charAt(i)));
+                    }
+                    LOGGER.info("[CACHE] [ADMIN] Line bytes (hex): {}", hexLine.toString());
+                    
                     line = line.trim();
-                    if (line.isEmpty()) continue; // Skip empty lines
+                    LOGGER.info("[CACHE] [ADMIN] Trimmed line: '{}'", line);
+                    if (line.isEmpty()) {
+                        LOGGER.info("[CACHE] [ADMIN] Skipping empty line");
+                        continue; // Skip empty lines
+                    }
                     
                     // Parse chunk size (in hex)
                     int idx = line.indexOf(';');
                     if (idx >= 0) {
+                        LOGGER.info("[CACHE] [ADMIN] Found chunk extension at position {}", idx);
                         line = line.substring(0, idx);
+                        LOGGER.info("[CACHE] [ADMIN] Chunk size part: '{}'", line);
                     }
                     
                     try {
+                        LOGGER.info("[CACHE] [ADMIN] Parsing chunk size from: '{}'", line);
                         chunkSize = Integer.parseInt(line, 16);
+                        LOGGER.info("[CACHE] [ADMIN] Parsed chunk size: {} bytes (decimal)", chunkSize);
                     } catch (NumberFormatException e) {
-                        LOGGER.error("[CACHE] [ADMIN] Invalid chunk size: {}", line);
+                        LOGGER.error("[CACHE] [ADMIN] Invalid chunk size: '{}' - {}", line, e.getMessage());
                         sendErrorResponse(clientSocket, 400, "Invalid chunk size");
                         return;
                     }
@@ -587,14 +609,33 @@ public class CachePlugin extends PowerTunnelPlugin {
                     
                     // Read chunk data
                     int remaining = chunkSize;
+                    LOGGER.info("[CACHE] [ADMIN] Starting to read chunk data of {} bytes", chunkSize);
+                    
                     while (remaining > 0) {
                         int toRead = Math.min(buffer.length, remaining);
+                        LOGGER.info("[CACHE] [ADMIN] Attempting to read {} bytes, remaining: {}", toRead, remaining);
+                        
                         bytesRead = rawInputStream.read(buffer, 0, toRead);
+                        LOGGER.info("[CACHE] [ADMIN] Actually read {} bytes", bytesRead);
                         
                         if (bytesRead == -1) {
                             LOGGER.error("[CACHE] [ADMIN] Unexpected end of stream while reading chunk");
                             sendErrorResponse(clientSocket, 400, "Unexpected end of stream");
                             return;
+                        }
+                        
+                        // Debug first chunk's first few bytes
+                        if (totalBytesRead == 0 && bytesRead > 0) {
+                            StringBuilder hexDump = new StringBuilder();
+                            StringBuilder charDump = new StringBuilder();
+                            int debugBytes = Math.min(bytesRead, 50);
+                            for (int i = 0; i < debugBytes; i++) {
+                                byte b = buffer[i];
+                                hexDump.append(String.format("%02X ", b));
+                                charDump.append((b >= 32 && b < 127) ? (char)b : '.');
+                            }
+                            LOGGER.info("[CACHE] [ADMIN] First {} bytes of chunk (hex): {}", debugBytes, hexDump.toString());
+                            LOGGER.info("[CACHE] [ADMIN] First {} bytes of chunk (ascii): {}", debugBytes, charDump.toString());
                         }
                         
                         contentBuffer.write(buffer, 0, bytesRead);
@@ -603,12 +644,16 @@ public class CachePlugin extends PowerTunnelPlugin {
                         
                         // Log progress every 1MB
                         if (totalBytesRead % (1024 * 1024) < 8192) {
-                            LOGGER.info("[CACHE] [ADMIN] Read progress: {} bytes", totalBytesRead);
+                            LOGGER.info("[CACHE] [ADMIN] Read progress: {} bytes ({} %)", 
+                                       totalBytesRead, 
+                                       (int)((totalBytesRead * 100.0) / chunkSize));
                         }
                     }
                     
                     // Read and discard CRLF after chunk data
-                    chunkReader.readLine();
+                    LOGGER.info("[CACHE] [ADMIN] Finished reading chunk data, reading trailing CRLF");
+                    String crlfLine = chunkReader.readLine();
+                    LOGGER.info("[CACHE] [ADMIN] Read CRLF line: '{}'", crlfLine);
                 }
                 
                 // Read and discard trailing headers (if any)
@@ -687,26 +732,21 @@ public class CachePlugin extends PowerTunnelPlugin {
         
         try {
             if (Files.exists(cacheDir)) {
-                try (DirectoryStream<Path> stream = Files.newDirectoryStream(cacheDir)) {
-                    for (Path entry : stream) {
-                        if (Files.isRegularFile(entry)) {
-                            entryCount++;
-                            totalSize += Files.size(entry);
-                        }
-                    }
-                }
+                long[] sizeArray = new long[1];
+                entryCount = countCacheFiles(cacheDir, sizeArray);
+                totalSize = sizeArray[0];
+                LOGGER.info("[CACHE] [ADMIN] Counted {} cache entries with total size {} bytes", entryCount, totalSize);
             }
-        } catch (IOException e) {
-            LOGGER.error("[CACHE] Error getting cache status: {}", e.getMessage());
+            
+            // Format response
+            String response = String.format("{\"status\":\"success\",\"entries\":%d,\"size\":%d,\"sizeFormatted\":\"%s\"}", 
+                    entryCount, totalSize, formatSize(totalSize));
+            
+            sendSuccessResponse(clientSocket, "application/json", response);
+        } catch (Exception e) {
+            LOGGER.error("[CACHE] [ADMIN] Error counting cache files: {}", e.getMessage());
             sendErrorResponse(clientSocket, 500, "Error getting cache status");
-            return;
         }
-        
-        // Format response
-        String response = String.format("{\"status\":\"success\",\"entries\":%d,\"size\":%d,\"sizeFormatted\":\"%s\"}", 
-                entryCount, totalSize, formatSize(totalSize));
-        
-        sendSuccessResponse(clientSocket, "application/json", response);
     }
     
     private void handleCacheClear(Socket clientSocket) throws IOException {
@@ -719,14 +759,107 @@ public class CachePlugin extends PowerTunnelPlugin {
                         if (Files.isRegularFile(entry)) {
                             Files.delete(entry);
                             deletedCount++;
+                        } else if (Files.isDirectory(entry)) {
+                            // Recursively delete subdirectories
+                            Files.walkFileTree(entry, new SimpleFileVisitor<Path>() {
+                                @Override
+                                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                                    Files.delete(file);
+                                    deletedCount++;
+                                    return FileVisitResult.CONTINUE;
+                                }
+                                
+                                @Override
+                                public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                                    Files.delete(dir);
+                                    return FileVisitResult.CONTINUE;
+                                }
+                            });
                         }
                     }
                 }
             }
             
-            LOGGER.info("[CACHE] Cache cleared: {} entries deleted", deletedCount);
-            sendSuccessResponse(clientSocket, "application/json", "{\"status\":\"success\",\"message\":\"Cache cleared\",\"deletedEntries\":" + deletedCount + "}");
-        } catch (IOException e) {
+            // Clear in-memory cache
+            cacheEntries.clear();
+            cacheSize = 0;
+            
+            // Format response
+            String response = String.format("{\"status\":\"success\",\"deleted\":%d}", deletedCount);
+            sendSuccessResponse(clientSocket, "application/json", response);
+        } catch (Exception e) {
+            LOGGER.error("[CACHE] Error clearing cache: {}", e.getMessage());
+            sendErrorResponse(clientSocket, 500, "Error clearing cache");
+        }
+    }
+    
+    /**
+     * Recursively count cache files and calculate total size
+     * @param directory The directory to scan
+     * @param totalSize Array with one element to store the total size
+     * @return Number of cache files found
+     */
+    private int countCacheFiles(Path directory, long[] totalSize) throws IOException {
+        int count = 0;
+        
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
+            for (Path entry : stream) {
+                if (Files.isRegularFile(entry)) {
+                    // Skip temporary files and metadata files
+                    String fileName = entry.getFileName().toString();
+                    if (!fileName.endsWith(".tmp") && !fileName.endsWith(".meta")) {
+                        count++;
+                        totalSize[0] += Files.size(entry);
+                        LOGGER.debug("[CACHE] [ADMIN] Counted cache file: {} ({} bytes)", entry, Files.size(entry));
+                    }
+                } else if (Files.isDirectory(entry)) {
+                    count += countCacheFiles(entry, totalSize);
+                }
+            }
+        }
+        
+        return count;
+    }
+
+    private void handleCacheClear(Socket clientSocket) throws IOException {
+        int deletedCount = 0;
+        
+        try {
+            if (Files.exists(cacheDir)) {
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(cacheDir)) {
+                    for (Path entry : stream) {
+                        if (Files.isRegularFile(entry)) {
+                            Files.delete(entry);
+                            deletedCount++;
+                        } else if (Files.isDirectory(entry)) {
+                            // Recursively delete subdirectories
+                            Files.walkFileTree(entry, new SimpleFileVisitor<Path>() {
+                                @Override
+                                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                                    Files.delete(file);
+                                    deletedCount++;
+                                    return FileVisitResult.CONTINUE;
+                                }
+                                
+                                @Override
+                                public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                                    Files.delete(dir);
+                                    return FileVisitResult.CONTINUE;
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            
+            // Clear in-memory cache
+            cacheEntries.clear();
+            cacheSize = 0;
+            
+            // Format response
+            String response = String.format("{\"status\":\"success\",\"deleted\":%d}", deletedCount);
+            sendSuccessResponse(clientSocket, "application/json", response);
+        } catch (Exception e) {
             LOGGER.error("[CACHE] Error clearing cache: {}", e.getMessage());
             sendErrorResponse(clientSocket, 500, "Error clearing cache");
         }

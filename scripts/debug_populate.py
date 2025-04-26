@@ -3,6 +3,16 @@ import os
 import requests
 import sys
 import time
+import logging
+import http.client as http_client
+
+# Set up detailed HTTP logging
+http_client.HTTPConnection.debuglevel = 1
+logging.basicConfig()
+logging.getLogger().setLevel(logging.DEBUG)
+requests_log = logging.getLogger("requests.packages.urllib3")
+requests_log.setLevel(logging.DEBUG)
+requests_log.propagate = True
 
 def populate_jellyfin_video_cache(video_path, item_id, api_key, proxy_url="http://localhost:8081"):
     """
@@ -51,15 +61,44 @@ def populate_jellyfin_video_cache(video_path, item_id, api_key, proxy_url="http:
             session = requests.Session()
             session.timeout = (10, 300)  # 10s connect timeout, 5min read timeout
             
+            # Debug the request format
+            print("\n=== DEBUG REQUEST FORMAT ===")
+            print("Headers being sent:")
+            for k, v in headers.items():
+                print(f"  {k}: {v}")
+            print("Using chunked encoding: Yes (automatic with streaming)")
+            print("Chunk size for reading: {} bytes".format(chunk_size))
+            print("=== END DEBUG INFO ===\n")
+            
             # Stream the file in chunks with progress reporting
             def read_in_chunks():
                 bytes_read = 0
                 last_report = 0
+                chunk_count = 0
+                
                 while True:
                     chunk = f.read(chunk_size)
                     if not chunk:
+                        print(f"End of file reached after {chunk_count} chunks")
                         break
+                    
                     bytes_read += len(chunk)
+                    chunk_count += 1
+                    
+                    # Debug first few chunks
+                    if chunk_count <= 2:
+                        print(f"\n=== DEBUG CHUNK {chunk_count} ====")
+                        print(f"Chunk size: {len(chunk)} bytes")
+                        # Print first 50 bytes as hex
+                        hex_preview = ' '.join([f'{b:02X}' for b in chunk[:50]])
+                        print(f"First 50 bytes (hex): {hex_preview}")
+                        # Try to print as ASCII if possible
+                        try:
+                            ascii_preview = ''.join([chr(b) if 32 <= b < 127 else '.' for b in chunk[:50]])
+                            print(f"First 50 bytes (ascii): {ascii_preview}")
+                        except:
+                            print("Could not convert to ASCII")
+                        print(f"=== END CHUNK {chunk_count} ===\n")
                     
                     # Report progress every 5MB
                     if bytes_read - last_report >= 5 * 1024 * 1024:
@@ -71,11 +110,26 @@ def populate_jellyfin_video_cache(video_path, item_id, api_key, proxy_url="http:
                     
                     yield chunk
             
-            # Make the request with streaming data
+            # Option 1: Use streaming with chunked encoding (original approach)
+            # response = session.post(
+            #     f"{proxy_url}/cache/populate",
+            #     headers=headers,
+            #     data=read_in_chunks()
+            # )
+            
+            # Option 2: Load the entire file into memory and use Content-Length
+            print("\n=== USING NON-CHUNKED APPROACH ===\n")
+            file_content = f.read()
+            print(f"Read entire file into memory: {len(file_content)} bytes")
+            
+            # Make sure Content-Length is set correctly
+            headers["Content-Length"] = str(len(file_content))
+            
+            # Make the request with the entire file content
             response = session.post(
                 f"{proxy_url}/cache/populate",
                 headers=headers,
-                data=read_in_chunks()
+                data=file_content
             )
             
             elapsed = time.time() - start_time
@@ -122,12 +176,56 @@ def main():
     
     print(f"\nCache population {'successful' if success else 'failed'}")
     
-    # Get cache status
+    # Check cache status after population
     try:
-        status = requests.get("http://localhost:8081/cache/status", timeout=5)
-        print(f"\nCache status: {status.text}")
-    except:
-        print("Could not retrieve cache status")
+        session = requests.Session()
+        session.timeout = (10, 300)  # 10s connect timeout, 5min read timeout
+        status_response = session.get(f"http://localhost:8081/cache/status")
+        print(f"\nCache status: {status_response.text}")
+    except Exception as e:
+        print(f"Error checking cache status: {e}")
+        
+    # Verify cache by checking the cache files directly using ADB
+    print("\nVerifying cache by checking cache files directly...")
+    try:
+        # Generate the expected cache key path based on the URL pattern we've seen in logs
+        cache_key = f"http://localhost:8096/Items/{video['item_id']}/Download?api_key={api_key}"
+        print(f"Checking for cache files for URL: {cache_key}")
+        
+        # Use subprocess to run ADB commands
+        import subprocess
+        
+        # Check the cache directory structure
+        cmd = ["adb", "shell", "run-as", "io.github.krlvm.powertunnel.android.dev", 
+               "find", "/data/data/io.github.krlvm.powertunnel.android.dev/cache/powertunnel", 
+               "-type", "f", "-not", "-name", "*.tmp", "-not", "-name", "*.meta"]
+        
+        print("\nRunning command to list cache files:")
+        print(" ".join(cmd))
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0 and result.stdout.strip():
+            print("\nFound cache files:")
+            for line in result.stdout.strip().split('\n'):
+                print(f"  {line}")
+                
+            # Get file size
+            size_cmd = ["adb", "shell", "run-as", "io.github.krlvm.powertunnel.android.dev", 
+                       "ls", "-la", result.stdout.strip().split('\n')[0]]
+            size_result = subprocess.run(size_cmd, capture_output=True, text=True)
+            
+            if size_result.returncode == 0:
+                print("\nCache file details:")
+                print(size_result.stdout.strip())
+                
+            print("\n✅ Cache files verified on disk")
+        else:
+            print("\n❌ No cache files found or error running command")
+            if result.stderr:
+                print(f"Error: {result.stderr}")
+    except Exception as e:
+        print(f"Error verifying cache: {e}")
 
 if __name__ == "__main__":
     main()
