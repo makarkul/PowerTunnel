@@ -21,6 +21,8 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.net.URL;
+import java.net.ServerSocket;
+import java.net.Socket;
 
 public class CachePlugin extends PowerTunnelPlugin {
     // Per-connection request tracking
@@ -41,6 +43,10 @@ public class CachePlugin extends PowerTunnelPlugin {
 
 
     private Path cacheDir;
+    private ServerSocket adminServer;
+    private int adminPort = 8081;
+    private boolean adminServerRunning = false;
+    private Thread adminServerThread;
 
     private boolean isCacheable(ProxyRequest request) {
         String method = request.getMethod().toString();
@@ -340,8 +346,411 @@ public class CachePlugin extends PowerTunnelPlugin {
         chunkData.remove(fullUrl);
     }
 
+    private void startAdminServer() {
+        if (adminServerRunning) {
+            LOGGER.info("[CACHE] Admin server already running on port {}", adminPort);
+            return;
+        }
+        
+        adminServerThread = new Thread(() -> {
+            try {
+                adminServer = new ServerSocket(adminPort);
+                adminServerRunning = true;
+                LOGGER.info("[CACHE] Admin server started on port {}", adminPort);
+                
+                while (adminServerRunning) {
+                    try {
+                        Socket clientSocket = adminServer.accept();
+                        new Thread(() -> handleClientConnection(clientSocket)).start();
+                    } catch (IOException e) {
+                        if (adminServerRunning) {
+                            LOGGER.error("[CACHE] Error accepting client connection: {}", e.getMessage());
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                LOGGER.error("[CACHE] Error starting admin server: {}", e.getMessage());
+            } finally {
+                stopAdminServer();
+            }
+        });
+        
+        adminServerThread.setDaemon(true);
+        adminServerThread.start();
+    }
+
+    private void stopAdminServer() {
+        adminServerRunning = false;
+        if (adminServer != null) {
+            try {
+                adminServer.close();
+                LOGGER.info("[CACHE] Admin server stopped");
+            } catch (IOException e) {
+                LOGGER.error("[CACHE] Error stopping admin server: {}", e.getMessage());
+            }
+        }
+    }
+
+    private void handleClientConnection(Socket clientSocket) {
+        try {
+            // Set a reasonable timeout to prevent hanging connections
+            clientSocket.setSoTimeout(30000); // 30 seconds
+            LOGGER.info("[CACHE] [ADMIN] New client connection from {}", clientSocket.getRemoteSocketAddress());
+            
+            BufferedReader reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
+            
+            // Read the request line
+            String requestLine = reader.readLine();
+            if (requestLine == null) {
+                LOGGER.warn("[CACHE] [ADMIN] Null request line from {}", clientSocket.getRemoteSocketAddress());
+                sendErrorResponse(clientSocket, 400, "Bad Request");
+                return;
+            }
+            
+            LOGGER.info("[CACHE] [ADMIN] Request: {}", requestLine);
+            
+            // Parse the request line
+            String[] parts = requestLine.split(" ");
+            if (parts.length != 3) {
+                LOGGER.warn("[CACHE] [ADMIN] Invalid request line: {}", requestLine);
+                sendErrorResponse(clientSocket, 400, "Bad Request");
+                return;
+            }
+            
+            String method = parts[0];
+            String path = parts[1];
+            
+            LOGGER.info("[CACHE] [ADMIN] Method: {}, Path: {}", method, path);
+            
+            // Read headers
+            Map<String, String> headers = new HashMap<>();
+            String line;
+            while ((line = reader.readLine()) != null && !line.isEmpty()) {
+                int colonPos = line.indexOf(':');
+                if (colonPos > 0) {
+                    String key = line.substring(0, colonPos).trim().toLowerCase();
+                    String value = line.substring(colonPos + 1).trim();
+                    headers.put(key, value);
+                    LOGGER.info("[CACHE] [ADMIN] Header: '{}' = '{}'", key, value);
+                }
+            }
+            
+            // Handle different endpoints
+            if (path.startsWith("/cache/populate")) {
+                LOGGER.info("[CACHE] [ADMIN] Handling cache populate request");
+                handleCachePopulate(clientSocket, method, headers, reader);
+            } else if (path.startsWith("/cache/status")) {
+                LOGGER.info("[CACHE] [ADMIN] Handling cache status request");
+                handleCacheStatus(clientSocket);
+            } else if (path.startsWith("/cache/clear")) {
+                LOGGER.info("[CACHE] [ADMIN] Handling cache clear request");
+                handleCacheClear(clientSocket);
+            } else {
+                LOGGER.warn("[CACHE] [ADMIN] Unknown path: {}", path);
+                sendErrorResponse(clientSocket, 404, "Not Found");
+            }
+        } catch (IOException e) {
+            LOGGER.error("[CACHE] Error handling client connection: {}", e.getMessage());
+            try {
+                sendErrorResponse(clientSocket, 500, "Internal Server Error");
+            } catch (IOException ex) {
+                LOGGER.error("[CACHE] Error sending error response: {}", ex.getMessage());
+            }
+        } finally {
+            // Always close the socket when done
+            try {
+                clientSocket.close();
+            } catch (IOException e) {
+                LOGGER.error("[CACHE] Error closing client socket: {}", e.getMessage());
+            }
+        }
+    }
+    
+    private void sendErrorResponse(Socket clientSocket, int statusCode, String statusMessage) throws IOException {
+        PrintWriter writer = new PrintWriter(clientSocket.getOutputStream(), true);
+        writer.println("HTTP/1.1 " + statusCode + " " + statusMessage);
+        writer.println("Content-Type: text/plain");
+        writer.println("Content-Length: " + statusMessage.length());
+        writer.println("Connection: close");
+        writer.println();
+        writer.println(statusMessage);
+    }
+    
+    private void sendSuccessResponse(Socket clientSocket, String contentType, String content) throws IOException {
+        PrintWriter writer = new PrintWriter(clientSocket.getOutputStream(), true);
+        writer.println("HTTP/1.1 200 OK");
+        writer.println("Content-Type: " + contentType);
+        writer.println("Content-Length: " + content.length());
+        writer.println("Connection: close");
+        writer.println();
+        writer.println(content);
+    }
+    
+    private void handleCachePopulate(Socket clientSocket, String method, Map<String, String> headers, BufferedReader reader) throws IOException {
+        LOGGER.info("[CACHE] [ADMIN] Starting cache population request handling");
+        
+        // Increase socket timeout for large uploads
+        clientSocket.setSoTimeout(10 * 60 * 1000); // 10 minutes
+        
+        if (!"POST".equals(method)) {
+            LOGGER.warn("[CACHE] [ADMIN] Method not allowed: {}", method);
+            sendErrorResponse(clientSocket, 405, "Method Not Allowed");
+            return;
+        }
+        
+        // Get required headers
+        String host = headers.get("host");
+        String targetPath = headers.get("target-path");
+        String contentType = headers.get("content-type");
+        String contentLengthStr = headers.get("content-length");
+        String transferEncoding = headers.get("transfer-encoding");
+        boolean isChunked = "chunked".equalsIgnoreCase(transferEncoding);
+        
+        LOGGER.info("[CACHE] [ADMIN] Cache populate headers: host={}, targetPath={}, contentType={}, contentLength={}, transferEncoding={}", 
+                   host, targetPath, contentType, contentLengthStr, transferEncoding);
+        
+        if (host == null || targetPath == null || contentType == null) {
+            LOGGER.warn("[CACHE] [ADMIN] Missing required headers for cache population");
+            sendErrorResponse(clientSocket, 400, "Missing required headers: host, target-path, and content-type are required");
+            return;
+        }
+        
+        // For non-chunked requests, we need content-length
+        int contentLength = -1;
+        if (!isChunked && contentLengthStr == null) {
+            LOGGER.warn("[CACHE] [ADMIN] Missing Content-Length header for non-chunked request");
+            sendErrorResponse(clientSocket, 400, "Missing Content-Length header");
+            return;
+        }
+        
+        if (contentLengthStr != null) {
+            try {
+                contentLength = Integer.parseInt(contentLengthStr);
+                LOGGER.info("[CACHE] [ADMIN] Content length: {} bytes", contentLength);
+            } catch (NumberFormatException e) {
+                LOGGER.warn("[CACHE] [ADMIN] Invalid content length: {}", contentLengthStr);
+                sendErrorResponse(clientSocket, 400, "Invalid Content-Length");
+                return;
+            }
+        }
+        
+        // Get raw input stream for binary data
+        InputStream rawInputStream = clientSocket.getInputStream();
+        
+        // Read the request body directly as binary
+        LOGGER.info("[CACHE] [ADMIN] Starting to read binary request body");
+        ByteArrayOutputStream contentBuffer = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        int bytesRead;
+        int totalBytesRead = 0;
+        long startTime = System.currentTimeMillis();
+    
+        try {
+            if (isChunked) {
+                LOGGER.info("[CACHE] [ADMIN] Reading chunked encoded data");
+                // Handle chunked encoding
+                // First, consume any remaining data in the reader's buffer
+                while (reader.ready()) {
+                    reader.read();
+                }
+            
+                // Now read the chunked data
+                int chunkSize;
+                String line;
+                BufferedReader chunkReader = new BufferedReader(new InputStreamReader(rawInputStream));
+                
+                // Read chunk size line
+                while ((line = chunkReader.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty()) continue; // Skip empty lines
+                    
+                    // Parse chunk size (in hex)
+                    int idx = line.indexOf(';');
+                    if (idx >= 0) {
+                        line = line.substring(0, idx);
+                    }
+                    
+                    try {
+                        chunkSize = Integer.parseInt(line, 16);
+                    } catch (NumberFormatException e) {
+                        LOGGER.error("[CACHE] [ADMIN] Invalid chunk size: {}", line);
+                        sendErrorResponse(clientSocket, 400, "Invalid chunk size");
+                        return;
+                    }
+                    
+                    LOGGER.info("[CACHE] [ADMIN] Reading chunk of size: {} bytes", chunkSize);
+                    
+                    if (chunkSize == 0) {
+                        // Last chunk
+                        break;
+                    }
+                    
+                    // Read chunk data
+                    int remaining = chunkSize;
+                    while (remaining > 0) {
+                        int toRead = Math.min(buffer.length, remaining);
+                        bytesRead = rawInputStream.read(buffer, 0, toRead);
+                        
+                        if (bytesRead == -1) {
+                            LOGGER.error("[CACHE] [ADMIN] Unexpected end of stream while reading chunk");
+                            sendErrorResponse(clientSocket, 400, "Unexpected end of stream");
+                            return;
+                        }
+                        
+                        contentBuffer.write(buffer, 0, bytesRead);
+                        totalBytesRead += bytesRead;
+                        remaining -= bytesRead;
+                        
+                        // Log progress every 1MB
+                        if (totalBytesRead % (1024 * 1024) < 8192) {
+                            LOGGER.info("[CACHE] [ADMIN] Read progress: {} bytes", totalBytesRead);
+                        }
+                    }
+                    
+                    // Read and discard CRLF after chunk data
+                    chunkReader.readLine();
+                }
+                
+                // Read and discard trailing headers (if any)
+                while ((line = chunkReader.readLine()) != null && !line.isEmpty()) {
+                    // Just discard
+                }
+            } else {
+                // Handle normal content-length encoding
+                // First, consume any remaining data in the reader's buffer
+                while (reader.ready()) {
+                    reader.read();
+                }
+                
+                // Now read the binary data directly
+                while (totalBytesRead < contentLength && (bytesRead = rawInputStream.read(buffer)) != -1) {
+                    contentBuffer.write(buffer, 0, bytesRead);
+                    totalBytesRead += bytesRead;
+                    
+                    // Log progress every 1MB
+                    if (totalBytesRead % (1024 * 1024) < 8192) {
+                        LOGGER.info("[CACHE] [ADMIN] Read progress: {}/{} bytes ({} %)", 
+                                   totalBytesRead, contentLength, 
+                                   (int)((totalBytesRead * 100.0) / contentLength));
+                    }
+                }
+                
+                if (totalBytesRead < contentLength) {
+                    LOGGER.warn("[CACHE] [ADMIN] Incomplete request body: {} of {} bytes", 
+                               totalBytesRead, contentLength);
+                    sendErrorResponse(clientSocket, 400, "Incomplete request body");
+                    return;
+                }
+            }
+            
+            long elapsedMs = System.currentTimeMillis() - startTime;
+            LOGGER.info("[CACHE] [ADMIN] Finished reading request body: {} bytes in {} ms ({} KB/s)", 
+                       totalBytesRead, elapsedMs, 
+                       (totalBytesRead / 1024.0) / (elapsedMs / 1000.0));
+            
+            // Create a URL for the target
+            String url = "http://" + host + targetPath;
+            LOGGER.info("[CACHE] [ADMIN] Target URL for cache: {}", url);
+            
+            // Create a cache entry
+            byte[] content = contentBuffer.toByteArray();
+            CacheEntry entry = new CacheEntry(content, contentType, null, null);
+            
+            // Generate cache key and save to disk
+            String cacheKey = generateCacheKey(url);
+            LOGGER.info("[CACHE] [ADMIN] Generated cache key: {}", cacheKey);
+            
+            try {
+                saveToDisk(cacheKey, entry);
+                LOGGER.info("[CACHE] [ADMIN] Successfully saved to disk: {} ({} bytes)", cacheKey, content.length);
+            } catch (Exception e) {
+                LOGGER.error("[CACHE] [ADMIN] Error saving to disk: {}", e.getMessage(), e);
+                sendErrorResponse(clientSocket, 500, "Error saving to cache");
+                return;
+            }
+            
+            LOGGER.info("[CACHE] [ADMIN] Manually populated cache for URL: {} ({} bytes)", url, content.length);
+            
+            // Send success response
+            sendSuccessResponse(clientSocket, "application/json", "{\"status\":\"success\",\"message\":\"Cache populated successfully\",\"url\":\"" + url + "\",\"size\":" + content.length + "}");
+            
+        } catch (IOException e) {
+            LOGGER.error("[CACHE] [ADMIN] Error reading request body: {}", e.getMessage(), e);
+            sendErrorResponse(clientSocket, 500, "Error reading request body: " + e.getMessage());
+        }
+    }
+    
+    private void handleCacheStatus(Socket clientSocket) throws IOException {
+        // Count cache entries and total size
+        int entryCount = 0;
+        long totalSize = 0;
+        
+        try {
+            if (Files.exists(cacheDir)) {
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(cacheDir)) {
+                    for (Path entry : stream) {
+                        if (Files.isRegularFile(entry)) {
+                            entryCount++;
+                            totalSize += Files.size(entry);
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            LOGGER.error("[CACHE] Error getting cache status: {}", e.getMessage());
+            sendErrorResponse(clientSocket, 500, "Error getting cache status");
+            return;
+        }
+        
+        // Format response
+        String response = String.format("{\"status\":\"success\",\"entries\":%d,\"size\":%d,\"sizeFormatted\":\"%s\"}", 
+                entryCount, totalSize, formatSize(totalSize));
+        
+        sendSuccessResponse(clientSocket, "application/json", response);
+    }
+    
+    private void handleCacheClear(Socket clientSocket) throws IOException {
+        int deletedCount = 0;
+        
+        try {
+            if (Files.exists(cacheDir)) {
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(cacheDir)) {
+                    for (Path entry : stream) {
+                        if (Files.isRegularFile(entry)) {
+                            Files.delete(entry);
+                            deletedCount++;
+                        }
+                    }
+                }
+            }
+            
+            LOGGER.info("[CACHE] Cache cleared: {} entries deleted", deletedCount);
+            sendSuccessResponse(clientSocket, "application/json", "{\"status\":\"success\",\"message\":\"Cache cleared\",\"deletedEntries\":" + deletedCount + "}");
+        } catch (IOException e) {
+            LOGGER.error("[CACHE] Error clearing cache: {}", e.getMessage());
+            sendErrorResponse(clientSocket, 500, "Error clearing cache");
+        }
+    }
+    
+    private String formatSize(long bytes) {
+        final String[] units = new String[] { "B", "KB", "MB", "GB", "TB" };
+        int unitIndex = 0;
+        double size = bytes;
+        
+        while (size >= 1024 && unitIndex < units.length - 1) {
+            size /= 1024;
+            unitIndex++;
+        }
+        
+        return String.format("%.2f %s", size, units[unitIndex]);
+    }
+
     @Override
     public void onProxyInitialization(@NotNull ProxyServer proxy) {
+        startAdminServer();
+        
+        // Register shutdown hook to stop admin server
+        Runtime.getRuntime().addShutdownHook(new Thread(this::stopAdminServer));
         try {
             // Initialize cache directory
             cacheDir = Paths.get("/data/data/io.github.krlvm.powertunnel.android.dev/cache/powertunnel");
