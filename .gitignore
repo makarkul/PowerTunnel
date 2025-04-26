@@ -1,10 +1,42 @@
 # Idea Files
 /.idea/
 /PowerTunnel.iml
+*.iml
 
 # Build Files
 /build/
 /.gradle/
+**/build/
+**/bin/
+**/out/
+**/target/
 
+# Gradle files
+.gradle/
+*/.gradle/
+local.properties
+
+# Compiled class files
+**/*.class
+
+# Backup files
+**/*.bak
+**/*.backup
+
+# Logs
+*.log
+
+# Package files
+*.jar
+*.war
+*.ear
+
+# Exception for gradle wrapper
+!gradle/wrapper/gradle-wrapper.jar
+
+# Security files
 key.properties
 keystore.jks
+
+# Test files
+scripts/Sample*.mp4
