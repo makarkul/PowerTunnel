@@ -39,4 +39,5 @@ key.properties
 keystore.jks
 
 # Test files
-scripts/Sample*.mp4
+# Sample videos are included for testing
+# scripts/Sample*.mp4
