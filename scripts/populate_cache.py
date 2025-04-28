@@ -160,22 +160,26 @@ def main():
         print("Admin server not running or not accessible")
         return
     
+    media_dir = os.path.join(os.path.dirname(__file__), "media")
+    
     # Sample videos with Jellyfin item IDs
     videos = [
+        # Enable only the 5s sample video
         {
-            "path": "./Sample (2024)_05s.mp4",  # 5-second sample
-            "item_id": "3b78c1e5f8665308433a2f8c5b8a9da2",
-            "name": "5-second sample"
+            "path": os.path.join(media_dir, "SampleVideo (2024)_05s.mp4"),
+            "item_id": "8f212c2c56d0a5b6c2247bb7e7c0e4f8",
+            "name": "5s Sample Video"
         },
-        {
-            "path": "./Sample (2024)_30s.mp4",  # 30-second sample
-            "item_id": "5a9c8f3e7d1b6c2a4f8e9d7c6b5a3f2e",  # Use the correct ID for the 30s video
-            "name": "30-second sample"
-        }
+        # Uncomment to enable the 30s sample video
+        # {
+        #     "path": os.path.join(media_dir, "SampleVideo (2024)_30s.mp4"),
+        #     "item_id": "eeb4ac3febf10cbe8b94c54be76431df",
+        #     "name": "30s Sample Video"
+        # }
     ]
     
     # API key from the URLs
-    api_key = "856c2b939fb34c0bb9aef9909840dbaa"
+    api_key = "c725ae3221e248019261c1a9aaea0cbb"
     
     # Populate cache with the videos
     for video in videos:
