@@ -52,7 +52,15 @@ def populate_jellyfin_video_cache(video_path, item_id, api_key, proxy_url="http:
     chunk_size = 1024 * 1024  # 1MB chunks
     
     # Open and stream the file in binary mode
-    with open(video_path, "rb") as f:
+    with open(video_path, 'rb') as f:
+        # Load the entire file into memory for non-chunked transfer
+        print("\n=== USING NON-CHUNKED APPROACH WITH EXPLICIT CONTENT-LENGTH ===\n")
+        file_content = f.read()
+        print(f"Read entire file into memory: {len(file_content)} bytes")
+        
+        # Set Content-Length header explicitly
+        headers["Content-Length"] = str(len(file_content))
+        
         print(f"Sending request to {proxy_url}/cache/populate...")
         start_time = time.time()
         
@@ -63,69 +71,11 @@ def populate_jellyfin_video_cache(video_path, item_id, api_key, proxy_url="http:
             
             # Debug the request format
             print("\n=== DEBUG REQUEST FORMAT ===")
-            print("Headers being sent:")
             for k, v in headers.items():
                 print(f"  {k}: {v}")
-            print("Using chunked encoding: Yes (automatic with streaming)")
-            print("Chunk size for reading: {} bytes".format(chunk_size))
+            print("Using chunked encoding: No (explicit Content-Length)")
             print("=== END DEBUG INFO ===\n")
             
-            # Stream the file in chunks with progress reporting
-            def read_in_chunks():
-                bytes_read = 0
-                last_report = 0
-                chunk_count = 0
-                
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk:
-                        print(f"End of file reached after {chunk_count} chunks")
-                        break
-                    
-                    bytes_read += len(chunk)
-                    chunk_count += 1
-                    
-                    # Debug first few chunks
-                    if chunk_count <= 2:
-                        print(f"\n=== DEBUG CHUNK {chunk_count} ====")
-                        print(f"Chunk size: {len(chunk)} bytes")
-                        # Print first 50 bytes as hex
-                        hex_preview = ' '.join([f'{b:02X}' for b in chunk[:50]])
-                        print(f"First 50 bytes (hex): {hex_preview}")
-                        # Try to print as ASCII if possible
-                        try:
-                            ascii_preview = ''.join([chr(b) if 32 <= b < 127 else '.' for b in chunk[:50]])
-                            print(f"First 50 bytes (ascii): {ascii_preview}")
-                        except:
-                            print("Could not convert to ASCII")
-                        print(f"=== END CHUNK {chunk_count} ===\n")
-                    
-                    # Report progress every 5MB
-                    if bytes_read - last_report >= 5 * 1024 * 1024:
-                        percent = (bytes_read / file_size) * 100
-                        elapsed = time.time() - start_time
-                        rate = bytes_read / elapsed / 1024 / 1024 if elapsed > 0 else 0
-                        print(f"Progress: {bytes_read}/{file_size} bytes ({percent:.1f}%) - {rate:.2f} MB/s")
-                        last_report = bytes_read
-                    
-                    yield chunk
-            
-            # Option 1: Use streaming with chunked encoding (original approach)
-            # response = session.post(
-            #     f"{proxy_url}/cache/populate",
-            #     headers=headers,
-            #     data=read_in_chunks()
-            # )
-            
-            # Option 2: Load the entire file into memory and use Content-Length
-            print("\n=== USING NON-CHUNKED APPROACH ===\n")
-            file_content = f.read()
-            print(f"Read entire file into memory: {len(file_content)} bytes")
-            
-            # Make sure Content-Length is set correctly
-            headers["Content-Length"] = str(len(file_content))
-            
-            # Make the request with the entire file content
             response = session.post(
                 f"{proxy_url}/cache/populate",
                 headers=headers,
